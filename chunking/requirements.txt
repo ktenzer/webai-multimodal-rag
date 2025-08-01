@@ -1,0 +1,5 @@
+--extra-index-url https://gitlab.com/api/v4/projects/49121232/packages/pypi/simple
+webai_element_sdk==0.10.0
+
+langchain-text-splitters==0.3.8
+langchain-community==0.3.27

@@ -1,0 +1,16 @@
+--extra-index-url https://gitlab.com/api/v4/projects/49121232/packages/pypi/simple
+webai_element_sdk==0.10.0
+
+python-dotenv==1.0.1
+torch==2.6.0
+torchvision==0.21.0
+safetensors>=0.4.3
+transformers[vision]>=4.41.0
+pillow==11.3.0
+easyocr==1.7.2
+unstructured[all-docs]==0.18.9
+pdfplumber==0.11.7
+opencv-python-headless==4.12.0.88
+numpy==2.2.6
+pypdf==5.8.0
+

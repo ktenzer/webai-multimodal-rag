@@ -1,0 +1,12 @@
+--extra-index-url https://gitlab.com/api/v4/projects/49121232/packages/pypi/simple
+webai_element_sdk==0.10.0
+
+torch==2.6.0
+torchvision==0.21.0
+safetensors>=0.4.3
+sentence-transformers==5.0.0
+transformers[vision]>=4.41.0
+pillow==11.3.0
+numpy==2.2.6
+python-dotenv==1.0.1
+
