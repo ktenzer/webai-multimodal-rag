@@ -1,37 +1,47 @@
 import asyncio
 import os, json, tempfile, warnings, logging
-import numpy as np
 from pathlib import Path
-import glob
-
-from webai_element_sdk.element import CreateElement
-from webai_element_sdk.process import Process, ProcessMetadata
-from webai_element_sdk.comms.messages import Frame, TextFrame
-
+import numpy as np
+from PIL import Image
 import torch
 from sentence_transformers import SentenceTransformer
 from transformers import CLIPModel, CLIPProcessor
-from PIL import Image
 
+from webai_element_sdk.element import CreateElement
+from webai_element_sdk.process import Process, ProcessMetadata
+from webai_element_sdk.comms.messages import Frame
 from .element import Inputs, Outputs, Settings
 
-# Quiet warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="transformers")
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
-TEXT_MODEL = "BAAI/bge-base-en-v1.5"
-CLIP_MODEL = "openai/clip-vit-base-patch32"
-device     = "mps" if torch.backends.mps.is_available() else "cpu"
+DEFAULT_TEXT_MODEL = "BAAI/bge-base-en-v1.5"
+DEFAULT_CLIP_MODEL = "openai/clip-vit-base-patch32"
 
-print("Loading embedding models …")
-embed_model = SentenceTransformer(TEXT_MODEL, device=device)
-clip_model  = CLIPModel.from_pretrained(CLIP_MODEL).to(device)
-clip_proc   = CLIPProcessor.from_pretrained(CLIP_MODEL, use_fast=True)
-print("Embedding models ready\n")
+# Lazy globals
+embed_model = None
+clip_model  = None
+clip_proc   = None
+_current_text_model = None
+_current_clip_model = None
+
+device = "mps" if torch.backends.mps.is_available() else "cpu"
+
+def ensure_models(text_model_name: str, clip_model_name: str):
+    global embed_model, clip_model, clip_proc, _current_text_model, _current_clip_model
+    if embed_model is None or _current_text_model != text_model_name:
+        print(f"Loading text embedding model: {text_model_name}")
+        embed_model = SentenceTransformer(text_model_name, device=device)
+        _current_text_model = text_model_name
+    if clip_model is None or _current_clip_model != clip_model_name:
+        print(f"Loading CLIP model: {clip_model_name}")
+        clip_model = CLIPModel.from_pretrained(clip_model_name).to(device)
+        clip_proc  = CLIPProcessor.from_pretrained(clip_model_name, use_fast=True)
+        _current_clip_model = clip_model_name
 
 class SciEmbedding:
-    def __init__(self):
-        self.model = SentenceTransformer(TEXT_MODEL, device=device)
+    def __init__(self, model_name: str):
+        self.model = SentenceTransformer(model_name, device=device)
         self.dim   = self.model.get_sentence_embedding_dimension()
     def __call__(self, texts):
         return self.model.encode(texts, convert_to_numpy=True).tolist()
@@ -49,13 +59,37 @@ IDLE_TIMEOUT = 3.0  # seconds
 
 class Embedder:
     def __init__(self):
-        self.text_ef = SciEmbedding()
+        # set in run() based on the user’s dropdown
+        self.text_ef = None
+        self._text_model_name = None
 
     async def run(self, process: Process):
         outputs = process.outputs
-        ingest_mode = bool(getattr(process.settings, "is_ingestion", None) and process.settings.is_ingestion.value)
 
-        # ---------- INGESTION MODE: auto-exit after idle ----------
+        # Read settings (with safe defaults)
+        text_model_name = (
+            getattr(process.settings, "text_model", None)
+            and process.settings.text_model.value
+        ) or DEFAULT_TEXT_MODEL
+        clip_model_name = (
+            getattr(process.settings, "clip_model", None)
+            and process.settings.clip_model.value
+        ) or DEFAULT_CLIP_MODEL
+
+        # Make sure global models match the chosen settings
+        ensure_models(text_model_name, clip_model_name)
+
+        # Refresh the per-instance text encoder if needed
+        if self.text_ef is None or self._text_model_name != text_model_name:
+            self.text_ef = SciEmbedding(text_model_name)
+            self._text_model_name = text_model_name
+
+        ingest_mode = bool(
+            getattr(process.settings, "is_ingestion", None)
+            and process.settings.is_ingestion.value
+        )
+
+        # INGESTION MODE: auto-exit after idle
         if ingest_mode:
             IDLE_TIMEOUT = 3.0  # seconds
             processed_any = False
@@ -74,7 +108,6 @@ class Embedder:
                     print("Embedding (ingest): input stream closed; exiting.")
                     break
 
-                # --- expect path from Chunking via Frame.other_data["file_path"] ---
                 other = getattr(frame, "other_data", None) or {}
                 in_path = (other.get("file_path", "") or "").strip()
                 if not in_path or not os.path.exists(in_path):
@@ -104,7 +137,7 @@ class Embedder:
                     for d in img_docs:
                         p = d["metadata"]["image_path"]
                         img_embs.append(clip_embed_image(p, device=device))
-                        img_docs_out.append("")   # mirrors original
+                        img_docs_out.append("") 
                         img_metas.append(d["metadata"])
 
                 fd, out_path = tempfile.mkstemp(prefix="embeds_", suffix=".json", dir="/tmp")
@@ -124,11 +157,10 @@ class Embedder:
                 processed_any = True
 
             print("Embedding (ingest): finished; exiting.")
-            return  # <- important: stop here in ingestion mode
+            return 
 
-        # ---------- NON-INGESTION MODE: stay alive indefinitely ----------
+        # NON-INGESTION MODE: stay alive indefinitely
         while True:
-            # attach to the input stream and consume until it closes; then reattach
             ait = process.inputs.wait_for_frame()
             try:
                 while True:
@@ -151,14 +183,13 @@ class Embedder:
                         message = (getattr(frame, "text", "") or "").strip()
 
                     if not message:
-                        # quietly ignore empty/control frames
                         continue
 
-                    # compute embeddings for the user message
+                    # Compute embeddings
                     embs_vec = self.text_ef([message])[0]
                     db_path = Path(os.getenv("CHROMA_DIR", "./chroma_db/webai")).resolve()
 
-                    # emit embeddings + message to downstream (vector retrieval)
+                    # Emit embeddings + message to downstream (vector retrieval)
                     await outputs.default.send(
                         Frame(
                             None, [], None, None, None,
@@ -171,7 +202,7 @@ class Embedder:
                     )
 
             except StopAsyncIteration:
-                # upstream temporarily closed; stay resident and reattach
+                # upstream temporarily closed, reattach
                 await asyncio.sleep(0.25)
                 continue
 
@@ -185,7 +216,7 @@ process = CreateElement(Process(
         id="2a7a0b6a-7b84-4c57-8f1c-embed000001",
         name="embedding",
         displayName="MM - Embedding Element",
-        version="0.23.0",
+        version="0.24.0",
         description="Receives chunk file path, writes embeddings file, outputs that path."
     ),
     run_func=embedder.run
