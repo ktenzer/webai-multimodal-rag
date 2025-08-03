@@ -1,4 +1,4 @@
-# chunking/__init__.py
+import asyncio
 import os, json, time, tempfile
 from pathlib import Path
 from typing import List
@@ -25,69 +25,63 @@ def md_split(docs, chunk=800, overlap=80):
     print(f"{len(out)} chunks ({time.time()-t0:.1f}s)\n")
     return out
 
-import asyncio
+
+IDLE_TIMEOUT = 3.0  # seconds
 class Chunker:
-    def __init__(self):
-        self.q = asyncio.Queue(8)
-
-    async def frame_receiver(self, _: str, frame: Frame):
-        # Push raw frames into our own queue (avoid wait_for_frame() to prevent "Already borrowed")
-        await self.q.put(frame)
-
     async def run(self, process: Process):
         outputs = process.outputs
         processed = set()
+        processed_any = False
+        ait = process.inputs.wait_for_frame()  # no frame_receiver_func -> no extra task
 
         while True:
-            frame = await self.q.get()
             try:
-                other = getattr(frame, "other_data", None) or {}
-                in_path = (other.get("file_path", "") or "").strip()
-
-                if not in_path or not Path(in_path).exists():
-                    print(f"Chunking: invalid path received: {in_path!r}; skipping.")
-                    continue
-                if in_path in processed:
-                    print(f"Chunking: duplicate path: {in_path}; skipping.")
-                    continue
-
-                print(f"Chunking processing: {in_path}")
-                with open(in_path, "r", encoding="utf-8") as f:
-                    bundle = json.load(f)
-
-                text_docs = [
-                    Document(page_content=d["page_content"], metadata=d["metadata"])
-                    for d in bundle.get("text_docs", [])
-                ]
-                img_docs = bundle.get("img_docs", [])
-
-                chunks = md_split(text_docs)
-                chunks_dicts = [{"page_content": d.page_content, "metadata": d.metadata} for d in chunks]
-
-                fd, out_path = tempfile.mkstemp(prefix="chunks_", suffix=".json", dir="/tmp")
-                os.close(fd)
-                with open(out_path, "w", encoding="utf-8") as f:
-                    json.dump(
-                        {
-                            "txt_chunks": chunks_dicts,
-                            "img_docs": img_docs,
-                            "prev_tmp_files": [in_path],
-                        },
-                        f,
-                        ensure_ascii=False,
-                    )
-                print(f"Chunking wrote: {out_path}")
-
-                # Send downstream using Frame.other_data
-                await outputs.default.send(
-                    Frame(None, [], None, None, None, {"file_path": out_path})
-                )
-                processed.add(in_path)
-
-                # We expect one OCR bundle; exit after successful processing
+                if not processed_any:
+                    slot, frame = await ait.__anext__()
+                else:
+                    slot, frame = await asyncio.wait_for(ait.__anext__(), timeout=IDLE_TIMEOUT)
+            except asyncio.TimeoutError:
+                print("Chunking: idle timeout reached; exiting.")
                 break
-            finally:
-                self.q.task_done()
+            except StopAsyncIteration:
+                print("Chunking: input stream closed; exiting.")
+                break
+
+            other = getattr(frame, "other_data", None) or {}
+            in_path = (other.get("file_path", "") or "").strip()
+
+            if not in_path or not Path(in_path).exists():
+                print(f"Chunking: invalid path received: {in_path!r}; skipping.")
+                continue
+            if in_path in processed:
+                print(f"Chunking: duplicate path: {in_path}; skipping.")
+                continue
+
+            print(f"Chunking processing: {in_path}")
+            with open(in_path, "r", encoding="utf-8") as f:
+                bundle = json.load(f)
+
+            text_docs = [
+                Document(page_content=d["page_content"], metadata=d["metadata"])
+                for d in bundle.get("text_docs", [])
+            ]
+            img_docs = bundle.get("img_docs", [])
+
+            chunks = md_split(text_docs)
+            chunks_dicts = [{"page_content": d.page_content, "metadata": d.metadata} for d in chunks]
+
+            fd, out_path = tempfile.mkstemp(prefix="chunks_", suffix=".json", dir="/tmp")
+            os.close(fd)
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {"txt_chunks": chunks_dicts, "img_docs": img_docs, "prev_tmp_files": [in_path]},
+                    f, ensure_ascii=False
+                )
+            print(f"Chunking wrote: {out_path}")
+
+            await outputs.default.send(Frame(None, [], None, None, None, {"file_path": out_path}))
+            processed.add(in_path)
+            processed_any = True
 
         print("Chunking: finished; exiting.")
 
@@ -100,9 +94,8 @@ process = CreateElement(Process(
         id="2a7a0b6a-7b84-4c57-8f1c-chunk0000001",
         name="chunking",
         displayName="MM - Chunking Element",
-        version="0.22.0",  # bump to redeploy
+        version="0.26.0",  # bump to redeploy
         description="Splits OCR text docs into chunks; outputs path to chunk bundle."
     ),
-    frame_receiver_func=chunker.frame_receiver,  # <— important to avoid "Already borrowed"
     run_func=chunker.run
 ))

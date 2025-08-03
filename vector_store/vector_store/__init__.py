@@ -1,3 +1,4 @@
+import asyncio
 import os, json, time
 from pathlib import Path
 import glob
@@ -39,30 +40,37 @@ def build_stores_from_payload(payload, client):
 
     print(f"Vector DB ready ({time.time()-t0:.1f}s)\n")
 
-import asyncio
+
+IDLE_TIMEOUT = 3.0  # seconds
+
 class StoreWriter:
-    def __init__(self):
-        self.q = asyncio.Queue(4)
-
-    async def frame_receiver(self, _: str, frame: Frame):
-        await self.q.put(frame)
-
     async def run(self, process):
         user_dir = (process.settings.vector_db_folder_path.value or "").strip()
         chroma_dir = Path(user_dir).resolve()
         os.makedirs(chroma_dir, exist_ok=True)
         print(f"[VectorStore] Chroma DB directory: {chroma_dir}")
 
-        while True:
-            frame = await self.q.get()
+        processed_any = False
+        ait = process.inputs.wait_for_frame()  # consume directly
 
-            # >>> READ VIA Frame.other_data ONLY <<<
+        while True:
+            try:
+                if not processed_any:
+                    slot, frame = await ait.__anext__()
+                else:
+                    slot, frame = await asyncio.wait_for(ait.__anext__(), timeout=IDLE_TIMEOUT)
+            except asyncio.TimeoutError:
+                print("VectorStore: idle timeout reached; exiting.")
+                break
+            except StopAsyncIteration:
+                print("VectorStore: input stream closed; exiting.")
+                break
+
             other = getattr(frame, "other_data", None) or {}
             path = (other.get("file_path", "") or "").strip()
 
             if not path or not os.path.exists(path):
                 print(f"VectorStore: invalid path received: {path!r}. Skipping.")
-                self.q.task_done()
                 continue
 
             print(f"VectorStore received: {path}")
@@ -75,7 +83,7 @@ class StoreWriter:
             )
             build_stores_from_payload(payload, client)
 
-            # Cleanup tmp files from earlier stages + this file
+            # cleanup
             for p in payload.get("prev_tmp_files", []) + [path]:
                 try:
                     os.remove(p)
@@ -83,7 +91,9 @@ class StoreWriter:
                 except Exception as e:
                     print(f"Cleanup failed for {p}: {e}")
 
-            self.q.task_done()
+            processed_any = True
+
+        print("VectorStore: finished; exiting.")
 
 writer = StoreWriter()
 
@@ -94,10 +104,9 @@ process = CreateElement(Process(
         id="2a7a0b6a-7b84-4c57-8f1c-store000003",
         name="vector_store",
         displayName="MM - Vector Store Element",
-        version="0.11.0",
+        version="0.15.0",
         description="Consumes embeddings bundle filename and writes to Chroma; cleans up tmp files."
     ),
-    frame_receiver_func=writer.frame_receiver,
     run_func=writer.run
 ))
 

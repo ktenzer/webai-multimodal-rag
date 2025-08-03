@@ -303,8 +303,8 @@ process = CreateElement(Process(
     metadata=ProcessMetadata(
         id="2a7a0b6a-7b84-4c57-8f1c-retrv000003",
         name="vector_retrieval",
-        displayName="MM Vector Retrieval",
-        version="0.18.0",
+        displayName="MM - Vector Retrieval",
+        version="0.19.0",
         description="Consumes embeddings from input; performs MMR, BM25, CrossEncoder rerank, and CLIP; outputs structured results.",
     ),
     frame_receiver_func=retriever.frame_receiver,

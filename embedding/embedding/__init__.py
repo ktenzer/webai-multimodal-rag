@@ -1,3 +1,4 @@
+import asyncio
 import os, json, tempfile, warnings, logging
 import numpy as np
 from pathlib import Path
@@ -43,30 +44,41 @@ def clip_embed_image(path: str, device=None):
         feats = clip_model.get_image_features(**x)
     return feats[0].cpu().numpy().tolist()
 
-import asyncio
+
+IDLE_TIMEOUT = 3.0  # seconds
+
 class Embedder:
     def __init__(self):
-        self.q = asyncio.Queue(4)
         self.text_ef = SciEmbedding()
-
-    async def frame_receiver(self, _: str, frame: Frame):  
-        await self.q.put(frame)
 
     async def run(self, process: Process):
         outputs = process.outputs
-
         ingest_mode = bool(getattr(process.settings, "is_ingestion", None) and process.settings.is_ingestion.value)
 
-        while True:
-            frame = await self.q.get()
+        # ---------- INGESTION MODE: auto-exit after idle ----------
+        if ingest_mode:
+            IDLE_TIMEOUT = 3.0  # seconds
+            processed_any = False
+            ait = process.inputs.wait_for_frame()
 
-            if ingest_mode:
-                # INGESTION
+            while True:
+                try:
+                    if not processed_any:
+                        slot, frame = await ait.__anext__()
+                    else:
+                        slot, frame = await asyncio.wait_for(ait.__anext__(), timeout=IDLE_TIMEOUT)
+                except asyncio.TimeoutError:
+                    print("Embedding (ingest): idle timeout reached; exiting.")
+                    break
+                except StopAsyncIteration:
+                    print("Embedding (ingest): input stream closed; exiting.")
+                    break
+
+                # --- expect path from Chunking via Frame.other_data["file_path"] ---
                 other = getattr(frame, "other_data", None) or {}
                 in_path = (other.get("file_path", "") or "").strip()
                 if not in_path or not os.path.exists(in_path):
-                    print(f"Embedding (ingest): invalid path received: {in_path!r}. Skipping.")
-                    self.q.task_done()
+                    print(f"Embedding (ingest): path invalid: {in_path!r}; skipping.")
                     continue
 
                 print(f"Embedding received: {in_path}")
@@ -92,7 +104,7 @@ class Embedder:
                     for d in img_docs:
                         p = d["metadata"]["image_path"]
                         img_embs.append(clip_embed_image(p, device=device))
-                        img_docs_out.append("")   # per original
+                        img_docs_out.append("")   # mirrors original
                         img_metas.append(d["metadata"])
 
                 fd, out_path = tempfile.mkstemp(prefix="embeds_", suffix=".json", dir="/tmp")
@@ -106,60 +118,62 @@ class Embedder:
                     json.dump(out_payload, f, ensure_ascii=False)
 
                 print(f"Embeddings wrote: {out_path}")
-
-                # >>> SEND VIA Frame.other_data <<<
                 await outputs.default.send(
-                    Frame(
-                        None, [], None, None, None,
-                        {"file_path": out_path}
-                    )
+                    Frame(None, [], None, None, None, {"file_path": out_path})
                 )
-                self.q.task_done()
-            else:
-                # Non-Ingestion
-                message = ""
-                try:
-                    other = getattr(frame, "other_data", None) or {}
-                    if isinstance(other, dict) and "api" in other:
-                        user_msgs = [x for x in other.get("api", []) if isinstance(x, dict) and x.get("role") == "user"]
-                        if user_msgs:
-                            message = user_msgs[-1].get("content", "") or ""
-                    if not message and isinstance(other, dict):
-                        message = other.get("message", "") or ""
-                except Exception as e:
-                    print(f"Non-ingestion: error extracting message from other_data: {e}")
+                processed_any = True
 
-                # Fallback: allow TextFrame.text to carry the message
-                if not message:
-                    message = (getattr(frame, "text", "") or "").strip()
+            print("Embedding (ingest): finished; exiting.")
+            return  # <- important: stop here in ingestion mode
 
-                if not message:
-                    print("No message text to embed.")
-                    self.q.task_done()
-                    continue
+        # ---------- NON-INGESTION MODE: stay alive indefinitely ----------
+        while True:
+            # attach to the input stream and consume until it closes; then reattach
+            ait = process.inputs.wait_for_frame()
+            try:
+                while True:
+                    slot, frame = await ait.__anext__()
 
-                # Compute embeddings
-                embs_vec = self.text_ef([message])[0]  
+                    # extract message (api format or plain message or fallback to text)
+                    message = ""
+                    try:
+                        other = getattr(frame, "other_data", None) or {}
+                        if isinstance(other, dict) and "api" in other:
+                            user_msgs = [x for x in other.get("api", []) if isinstance(x, dict) and x.get("role") == "user"]
+                            if user_msgs:
+                                message = user_msgs[-1].get("content", "") or ""
+                        if not message and isinstance(other, dict):
+                            message = other.get("message", "") or ""
+                    except Exception as e:
+                        print(f"Non-ingestion: error extracting message from other_data: {e}")
 
+                    if not message:
+                        message = (getattr(frame, "text", "") or "").strip()
 
-                db_path = Path(os.getenv("CHROMA_DIR", "./chroma_db/webai")).resolve()
+                    if not message:
+                        # quietly ignore empty/control frames
+                        continue
 
-                # Output Frame
-                await outputs.default.send(
-                    Frame(
-                        None,           # ndframe (required positional)
-                        [],             # rois
-                        None,           # color_space
-                        None,           # frame_id
-                        None,           # headers
-                        {               # other_data
-                            "message": message,
-                            "embeddings": embs_vec,
-                            "vector_index_path": str(db_path),
-                        },
+                    # compute embeddings for the user message
+                    embs_vec = self.text_ef([message])[0]
+                    db_path = Path(os.getenv("CHROMA_DIR", "./chroma_db/webai")).resolve()
+
+                    # emit embeddings + message to downstream (vector retrieval)
+                    await outputs.default.send(
+                        Frame(
+                            None, [], None, None, None,
+                            {
+                                "message": message,
+                                "embeddings": embs_vec,
+                                "vector_index_path": str(db_path),
+                            },
+                        )
                     )
-                )
-                self.q.task_done()
+
+            except StopAsyncIteration:
+                # upstream temporarily closed; stay resident and reattach
+                await asyncio.sleep(0.25)
+                continue
 
 embedder = Embedder()
 
@@ -171,10 +185,9 @@ process = CreateElement(Process(
         id="2a7a0b6a-7b84-4c57-8f1c-embed000001",
         name="embedding",
         displayName="MM - Embedding Element",
-        version="0.17.0",
+        version="0.23.0",
         description="Receives chunk file path, writes embeddings file, outputs that path."
     ),
-    frame_receiver_func=embedder.frame_receiver,
     run_func=embedder.run
 ))
 
