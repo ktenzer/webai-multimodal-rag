@@ -6,16 +6,13 @@ from webai_element_sdk.process import Process, ProcessMetadata
 from webai_element_sdk.comms.messages import Frame
 
 import chromadb
-from chromadb.config import Settings
+from chromadb.config import Settings as ChromaSettings  # alias to avoid clashes
 from .element import Inputs, Settings as VSSettings
-
-CHROMA_DIR = Path("./chroma_db/webai").resolve()
 
 def build_stores_from_payload(payload, client):
     print("Embedding & writing to Chroma …")
     t0 = time.time()
 
-    # Text collection
     txt_col = client.get_or_create_collection("text")
     docs = payload.get("txt_docs", [])
     metas= payload.get("txt_metadatas", [])
@@ -28,7 +25,6 @@ def build_stores_from_payload(payload, client):
             ids=[f"t{idx}" for idx in range(len(docs))]
         )
 
-    # Image collection
     img_docs = payload.get("img_docs", [])
     img_metas= payload.get("img_metadatas", [])
     img_embs = payload.get("img_embeddings", [])
@@ -53,34 +49,19 @@ class StoreWriter:
 
     async def run(self, process):
         user_dir = (process.settings.vector_db_folder_path.value or "").strip()
-        chroma_dir = Path(user_dir or "./chroma_db/webai").resolve()
+        chroma_dir = Path(user_dir).resolve()
         os.makedirs(chroma_dir, exist_ok=True)
         print(f"[VectorStore] Chroma DB directory: {chroma_dir}")
 
         while True:
             frame = await self.q.get()
 
-            # Local helper so it's always in scope
-            def _latest_tmp_local(pattern: str) -> str | None:
-                try:
-                    candidates = sorted(
-                        glob.glob(pattern),
-                        key=lambda p: os.path.getmtime(p),
-                        reverse=True,
-                    )
-                    return candidates[0] if candidates else None
-                except Exception as e:
-                    print(f"_latest_tmp_local error for pattern {pattern}: {e}")
-                    return None
-
-            # Prefer TextFrame.text; fallback to newest /tmp embeds bundle
-            path = (getattr(frame, "text", "") or "").strip()
-            if not path:
-                path = _latest_tmp_local("/tmp/embeds_*.json") or ""
-                print(f"VectorStore: no path in frame; fallback to latest: {path or 'NONE'}")
+            # >>> READ VIA Frame.other_data ONLY <<<
+            other = getattr(frame, "other_data", None) or {}
+            path = (other.get("file_path", "") or "").strip()
 
             if not path or not os.path.exists(path):
-                print("VectorStore: received no usable path. Skipping.")
+                print(f"VectorStore: invalid path received: {path!r}. Skipping.")
                 self.q.task_done()
                 continue
 
@@ -89,8 +70,8 @@ class StoreWriter:
                 payload = json.load(f)
 
             client = chromadb.PersistentClient(
-                path=str(chroma_dir),                        # <-- uses user setting
-                settings=Settings(anonymized_telemetry=False),
+                path=str(chroma_dir),
+                settings=ChromaSettings(anonymized_telemetry=False),
             )
             build_stores_from_payload(payload, client)
 
@@ -108,12 +89,12 @@ writer = StoreWriter()
 
 process = CreateElement(Process(
     inputs=Inputs(),
-    settings=VSSettings(),          
+    settings=VSSettings(),
     metadata=ProcessMetadata(
         id="2a7a0b6a-7b84-4c57-8f1c-store000003",
         name="vector_store",
         displayName="MM - Vector Store Element",
-        version="0.10.0",          
+        version="0.11.0",
         description="Consumes embeddings bundle filename and writes to Chroma; cleans up tmp files."
     ),
     frame_receiver_func=writer.frame_receiver,

@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 
 from webai_element_sdk.element import CreateElement
 from webai_element_sdk.process import Process, ProcessMetadata
-from webai_element_sdk.comms.messages import TextFrame
+from webai_element_sdk.comms.messages import Frame
 
 from PIL import Image
 import torch
@@ -150,7 +150,13 @@ class OCRElement:
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump({"text_docs": text_docs, "img_docs": img_docs, "source_dir": str(docs_dir)}, f, ensure_ascii=False)
         print(f"OCR wrote bundle: {tmp_path}")
-        await outputs.default.send(TextFrame(text=tmp_path)) 
+
+        await outputs.default.send(
+            Frame(
+                None, [], None, None, None,
+                {"file_path": tmp_path}
+            )
+        )
 
 ocr = OCRElement()
 
@@ -161,7 +167,7 @@ process = CreateElement(Process(
         id="2a7a0b6a-7b84-4c57-8f1c-ocr000000001",
         name="ocr",
         displayName="MM - OCR Element",
-        version="0.18.0",
+        version="0.20.0",
         description="Scans a folder, OCRs PDFs (and images), outputs path to JSON bundle with docs."
     ),
     run_func=ocr.run

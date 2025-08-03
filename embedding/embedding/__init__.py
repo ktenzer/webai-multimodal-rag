@@ -62,45 +62,23 @@ class Embedder:
 
             if ingest_mode:
                 # INGESTION
-                # Local helper so it's always in scope
-                def _latest_tmp_local(pattern: str) -> str | None:
-                    try:
-                        candidates = sorted(
-                            glob.glob(pattern),
-                            key=lambda p: os.path.getmtime(p),
-                            reverse=True,
-                        )
-                        return candidates[0] if candidates else None
-                    except Exception as e:
-                        print(f"_latest_tmp_local error for pattern {pattern}: {e}")
-                        return None
-
-                # Prefer TextFrame.text; fallback to newest /tmp chunks bundle
-                in_path = (getattr(frame, "text", "") or "").strip()
-                if not in_path:
-                    in_path = _latest_tmp_local("/tmp/chunks_*.json") or ""
-                    print(f"Embedding: no path in frame; fallback to latest: {in_path or 'NONE'}")
-
+                other = getattr(frame, "other_data", None) or {}
+                in_path = (other.get("file_path", "") or "").strip()
                 if not in_path or not os.path.exists(in_path):
-                    print("Embedding: received no usable path. Skipping.")
+                    print(f"Embedding (ingest): invalid path received: {in_path!r}. Skipping.")
                     self.q.task_done()
                     continue
 
                 print(f"Embedding received: {in_path}")
-
-                # Load chunk bundle
                 with open(in_path, "r", encoding="utf-8") as f:
                     bundle = json.load(f)
 
-                # Expecting fields from Chunking element
                 txt_chunks = bundle.get("txt_chunks", [])
                 img_docs   = bundle.get("img_docs", [])
 
-                # Prepare text docs and metas
                 docs  = [d["page_content"] for d in txt_chunks]
                 metas = [d["metadata"]     for d in txt_chunks]
 
-                # Text embeddings (BGE)
                 if docs:
                     print("Embedding text …")
                     txt_embs = self.text_ef(docs)
@@ -108,17 +86,15 @@ class Embedder:
                     print("No text chunks to embed.")
                     txt_embs = []
 
-                # Image embeddings (CLIP)
                 img_embs, img_metas, img_docs_out = [], [], []
                 if img_docs:
                     print("Embedding images …")
                     for d in img_docs:
                         p = d["metadata"]["image_path"]
                         img_embs.append(clip_embed_image(p, device=device))
-                        img_docs_out.append("")         
+                        img_docs_out.append("")   # per original
                         img_metas.append(d["metadata"])
 
-                # Write embeddings bundle and emit path
                 fd, out_path = tempfile.mkstemp(prefix="embeds_", suffix=".json", dir="/tmp")
                 os.close(fd)
                 out_payload = {
@@ -130,9 +106,15 @@ class Embedder:
                     json.dump(out_payload, f, ensure_ascii=False)
 
                 print(f"Embeddings wrote: {out_path}")
-                await outputs.default.send(TextFrame(text=out_path))
-                self.q.task_done()
 
+                # >>> SEND VIA Frame.other_data <<<
+                await outputs.default.send(
+                    Frame(
+                        None, [], None, None, None,
+                        {"file_path": out_path}
+                    )
+                )
+                self.q.task_done()
             else:
                 # Non-Ingestion
                 message = ""
@@ -156,14 +138,13 @@ class Embedder:
                     self.q.task_done()
                     continue
 
-                # 2) Compute embeddings using YOUR embedder (BGE) instead of `generate(...)`
-                #    Result should be a plain Python list (like your sample expects).
-                embs_vec = self.text_ef([message])[0]  # list[float]
+                # Compute embeddings
+                embs_vec = self.text_ef([message])[0]  
 
-                # 3) Provide a vector index path (keep same field as sample).
+
                 db_path = Path(os.getenv("CHROMA_DIR", "./chroma_db/webai")).resolve()
 
-                # 4) Emit a Frame with other_data (same shape as your sample)
+                # Output Frame
                 await outputs.default.send(
                     Frame(
                         None,           # ndframe (required positional)
@@ -190,7 +171,7 @@ process = CreateElement(Process(
         id="2a7a0b6a-7b84-4c57-8f1c-embed000001",
         name="embedding",
         displayName="MM - Embedding Element",
-        version="0.16.0",
+        version="0.17.0",
         description="Receives chunk file path, writes embeddings file, outputs that path."
     ),
     frame_receiver_func=embedder.frame_receiver,
