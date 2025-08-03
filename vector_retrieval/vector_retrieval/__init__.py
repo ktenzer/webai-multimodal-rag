@@ -24,19 +24,15 @@ from .element import Inputs, Outputs, Settings as VSSettings
 warnings.filterwarnings("ignore", category=UserWarning, module="transformers")
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
-# Constants
+# Constants (defaults; can be overridden by settings)
 TEXT_MODEL   = "BAAI/bge-base-en-v1.5"
 RERANK_MODEL = "BAAI/bge-reranker-base"
 CLIP_MODEL   = "openai/clip-vit-base-patch32"
 
-TOP_K_MMR    = 40
-TOP_K_BM25   = 10
-TOP_K_IMAGE  = 2
-
 device = "mps" if torch.backends.mps.is_available() else "cpu"
 
 print("Loading retrieval models …")
-embed_model = SentenceTransformer(TEXT_MODEL, device=device)  # kept (not used for query here)
+embed_model = SentenceTransformer(TEXT_MODEL, device=device)  # not used for query here
 reranker    = CrossEncoder(RERANK_MODEL, device=device)       # used for rerank
 clip_model  = CLIPModel.from_pretrained(CLIP_MODEL).to(device)
 clip_proc   = CLIPProcessor.from_pretrained(CLIP_MODEL, use_fast=True)
@@ -107,7 +103,7 @@ def rerank(query: str, docs: List[str], metas: List[dict], keep: int):
 # Cache BM25 per DB path
 class _BM25Cache:
     def __init__(self):
-        self.cache = {} 
+        self.cache = {}  # path -> (bm25, corpus_docs, corpus_metas)
     def get(self, client, path: Path):
         if path in self.cache:
             return self.cache[path]
@@ -148,6 +144,24 @@ class Retriever:
                 await outputs.default.send(TextFrame(text="Vector Retrieval: missing 'embeddings' in frame.other_data."))
                 self.q.task_done()
                 continue
+
+            # Read K settings (with safe defaults)
+            try:
+                K_MMR   = int(process.settings.top_k_mmr.value)
+            except Exception:
+                K_MMR   = 40
+            try:
+                K_BM25  = int(process.settings.top_k_bm25.value)
+            except Exception:
+                K_BM25  = 10
+            try:
+                K_IMAGE = int(process.settings.top_k_image.value)
+            except Exception:
+                K_IMAGE = 2
+            try:
+                K_FINAL = int(process.settings.top_k.value)
+            except Exception:
+                K_FINAL = 3
 
             # Normalize embeddings for Chroma (list[list[float]])
             if isinstance(embeds_in, list) and embeds_in and isinstance(embeds_in[0], (float, int)):
@@ -190,13 +204,13 @@ class Retriever:
             embs_raw  = np.array(txt["embeddings"][0], dtype=np.float32)
 
             # MMR diversity over top-60
-            docs_mmr, metas_mmr = mmr_select(query_emb, embs_raw, docs_raw, metas_raw, k=TOP_K_MMR, weight=0.6)
+            docs_mmr, metas_mmr = mmr_select(query_emb, embs_raw, docs_raw, metas_raw, k=K_MMR, weight=0.6)
 
             # BM25 lexical retrieval (only if we have text and a BM25 index)
             bm25, corpus_docs, corpus_metas = bm25_cache.get(client, chroma_dir)
             docs_bm, metas_bm = [], []
             if q and bm25:
-                idxs = bm25.query(q.lower(), k=TOP_K_BM25)
+                idxs = bm25.query(q.lower(), k=K_BM25)
                 docs_bm  = [corpus_docs[i]  for i in idxs]
                 metas_bm = [corpus_metas[i] for i in idxs]
 
@@ -204,24 +218,20 @@ class Retriever:
             docs_all  = docs_mmr + docs_bm
             metas_all = metas_mmr + metas_bm
             if q and docs_all:
-                keep_k = min(process.settings.top_k.value, len(docs_all))
+                keep_k = min(K_FINAL, len(docs_all))
                 docs, metas = rerank(q, docs_all, metas_all, keep=keep_k)
             else:
                 docs, metas = docs_all, metas_all
 
             # CLIP image retrieval (optional, requires q)
-            if q and img_col and img_col.count() > 0:
+            if q and img_col and img_col.count() > 0 and K_IMAGE > 0:
                 clip_vec = clip_text_ef([q])[0]
-                img = img_col.query(query_embeddings=[clip_vec], n_results=TOP_K_IMAGE)
+                img = img_col.query(query_embeddings=[clip_vec], n_results=K_IMAGE)
                 docs  += img["documents"][0]
                 metas += img["metadatas"][0]
 
-            # Top-k slice (defensive)
-            try:
-                top_k = int(getattr(process.settings, "top_k", None).value) if getattr(process.settings, "top_k", None) else len(docs)
-            except Exception:
-                top_k = len(docs)
-            n = min(top_k, len(docs))
+            # Top-k slice (defensive; respect final top_k)
+            n = min(K_FINAL, len(docs))
             docs_out  = [docs[i]  for i in range(n)]
             metas_out = [metas[i] for i in range(n)]
 
@@ -251,7 +261,7 @@ class Retriever:
                 + "\n\nCite facts like (Source 2)."
             )
 
-            # Citations for UI (only implement in Chat LLM not LLM element)
+            # Citations for UI
             citations = []
             for m in metas_out:
                 src = m.get("source") or m.get("image_path")
@@ -265,14 +275,11 @@ class Retriever:
             # Compose API messages and request id
             api_in = other.get("api") or []
             api_out = []
-            # Preserve any system messages from upstream
             for msg in api_in:
                 if isinstance(msg, dict) and msg.get("role") == "system":
                     api_out.append(msg)
-            # Add a user message containing the retrieval context
             api_out.append({"role": "user", "content": context_text})
 
-            # Preserve request id (supports both camelCase and snake_case); ensure int
             req_in = other.get("requestId", None)
             if req_in is None:
                 req_in = other.get("request_id", None)
@@ -292,10 +299,10 @@ class Retriever:
                 ],
                 "message": other.get("message", q),
                 "metadata": other.get("metadata", {}),
-                "api": api_out,               # chat messages for LLM
-                "citations": citations,       # for UI
-                "requestId": rid,             # camelCase (API/webframe)
-                "request_id": rid,            # snake_case (defensive/legacy)
+                "api": api_out,
+                "citations": citations,
+                "requestId": rid,
+                "request_id": rid,
             }
 
             # Debug summary
@@ -307,6 +314,7 @@ class Retriever:
                     "n_citations": len(other_data.get("citations", [])),
                     "message": other_data.get("message", ""),
                     "requestId": other_data.get("requestId"),
+                    "K_MMR": K_MMR, "K_BM25": K_BM25, "K_IMAGE": K_IMAGE, "K_FINAL": K_FINAL,
                 })
             except Exception as e:
                 print(f"[VectorRetrieval] preview failed: {e}")
@@ -324,8 +332,8 @@ process = CreateElement(Process(
         id="2a7a0b6a-7b84-4c57-8f1c-retrv000003",
         name="vector_retrieval",
         displayName="MM - Vector Retrieval",
-        version="0.21.0",
-        description="Consumes embeddings from input; performs MMR, BM25, CrossEncoder rerank, and CLIP; outputs structured results with requestId.",
+        version="0.22.0",
+        description="Consumes embeddings; performs MMR, BM25, CrossEncoder rerank, and CLIP; outputs structured results with requestId. K-values are user-configurable.",
     ),
     frame_receiver_func=retriever.frame_receiver,
     run_func=retriever.run

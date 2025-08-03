@@ -25,3 +25,30 @@ class Settings(ElementSettings):
         required=False,
         hints=["folder_path"],
     )
+
+    top_k_mmr = NumberSetting[int](
+        name="top_k_mmr",
+        display_name="Top K (MMR)",
+        description="Number of Maximal Marginal Relevant (MMR)-selected candidates from the vector search before reranking.",
+        default=40,
+        min_value=1,
+        step=1,
+    )
+
+    top_k_bm25 = NumberSetting[int](
+        name="top_k_bm25",
+        display_name="Top K (BM25)",
+        description="Number of BM25 lexical candidates to merge before reranking.",
+        default=10,
+        min_value=1,
+        step=1,
+    )
+
+    top_k_image = NumberSetting[int](
+        name="top_k_image",
+        display_name="Top K (Image)",
+        description="Number of image results to retrieve via CLIP.",
+        default=2,
+        min_value=1,
+        step=1,
+    )
