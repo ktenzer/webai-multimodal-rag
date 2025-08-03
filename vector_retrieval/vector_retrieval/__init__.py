@@ -36,13 +36,13 @@ TOP_K_IMAGE  = 2
 device = "mps" if torch.backends.mps.is_available() else "cpu"
 
 print("Loading retrieval models …")
-embed_model = SentenceTransformer(TEXT_MODEL, device=device)  # kept (used if we ever need text->emb)
-reranker    = CrossEncoder(RERANK_MODEL, device=device)       # kept for rerank
+embed_model = SentenceTransformer(TEXT_MODEL, device=device)  # kept (not used for query here)
+reranker    = CrossEncoder(RERANK_MODEL, device=device)       # used for rerank
 clip_model  = CLIPModel.from_pretrained(CLIP_MODEL).to(device)
 clip_proc   = CLIPProcessor.from_pretrained(CLIP_MODEL, use_fast=True)
 print("Models ready\n")
 
-# CLIP Text
+# CLIP text EF
 class CLIPTextEF(EmbeddingFunction):
     def __init__(self):
         self.proc, self.model = clip_proc, clip_model
@@ -54,6 +54,7 @@ class CLIPTextEF(EmbeddingFunction):
             inp = {k: v.to(device) for k, v in inp.items()}
             self.model.to(device)
             return self.model.get_text_features(**inp).cpu().numpy().tolist()
+
 clip_text_ef = CLIPTextEF()
 
 # MMR
@@ -79,6 +80,7 @@ def mmr_select(query_emb, doc_embs, docs, metas, k=20, weight=0.6):
         candidates.remove(idx)
     return sel_docs, sel_metas
 
+# BM25
 class BM25Store:
     def __init__(self, docs_lower: List[str]):
         self.model = BM25Okapi([d.split() for d in docs_lower])
@@ -87,6 +89,7 @@ class BM25Store:
         return idxs
 
 def shorten(t, w=200): return textwrap.shorten(" ".join((t or "").split()), width=w)
+
 def label(meta, idx):
     from pathlib import Path as _P
     if meta.get("image_path") and meta.get("caption"):
@@ -96,12 +99,12 @@ def label(meta, idx):
     flags = [k for k in ("table_md","table_json","table_row","chartqa","ocr") if meta.get(k)]
     return f"Source {idx}: {src}{' ('+'/'.join(flags)+')' if flags else ''}"
 
-def rerank(query: str, docs: List[str], metas: List[dict], keep: str):
+def rerank(query: str, docs: List[str], metas: List[dict], keep: int):
     scores = reranker.predict([(query, d if d else " ") for d in docs])
     best   = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:keep]
     return [docs[i] for i in best], [metas[i] for i in best]
 
-# ---- cache BM25 per DB path ----
+# Cache BM25 per DB path
 class _BM25Cache:
     def __init__(self):
         self.cache = {} 
@@ -127,19 +130,19 @@ class Retriever:
     def __init__(self):
         self.q = asyncio.Queue(16)
 
-    async def frame_receiver(self, _: str, frame: Frame): 
+    async def frame_receiver(self, _: str, frame: Frame):
         await self.q.put(frame)
 
-    async def run(self, process):
+    async def run(self, process: Process):
         outputs = process.outputs
         while True:
             frame = await self.q.get()
 
-            # Read embeddings, DB path, optional message 
+            # ---- Read embeddings + DB path + optional message ----
             other     = getattr(frame, "other_data", None) or {}
             embeds_in = other.get("embeddings")  # list[float] OR list[list[float]]
             q         = (other.get("message", "") or getattr(frame, "text", "") or "").strip()
-            db_path = (process.settings.vector_db_folder_path.value or "").strip()
+            db_path   = (process.settings.vector_db_folder_path.value or "").strip()
 
             if embeds_in is None:
                 await outputs.default.send(TextFrame(text="Vector Retrieval: missing 'embeddings' in frame.other_data."))
@@ -147,7 +150,7 @@ class Retriever:
                 continue
 
             # Normalize embeddings for Chroma (list[list[float]])
-            if isinstance(embeds_in, list) and len(embeds_in) > 0 and isinstance(embeds_in[0], (float, int)):
+            if isinstance(embeds_in, list) and embeds_in and isinstance(embeds_in[0], (float, int)):
                 query_emb = np.asarray(embeds_in, dtype=np.float32)
                 query_emb_list = [query_emb.tolist()]
             else:
@@ -155,8 +158,7 @@ class Retriever:
                 query_emb = np.asarray(embeds_in[0], dtype=np.float32)
 
             # Open client for this DB path
-            db_path = os.path.expanduser(db_path)
-            chroma_dir = Path(db_path).resolve()
+            chroma_dir = Path(os.path.expanduser(db_path)).resolve()
             client = chromadb.PersistentClient(
                 path=str(chroma_dir),
                 settings=ChromaSettings(anonymized_telemetry=False),
@@ -190,7 +192,7 @@ class Retriever:
             # MMR diversity over top-60
             docs_mmr, metas_mmr = mmr_select(query_emb, embs_raw, docs_raw, metas_raw, k=TOP_K_MMR, weight=0.6)
 
-            # BM25 lexical retrieval (only if we have a text message & a BM25 index)
+            # BM25 lexical retrieval (only if we have text and a BM25 index)
             bm25, corpus_docs, corpus_metas = bm25_cache.get(client, chroma_dir)
             docs_bm, metas_bm = [], []
             if q and bm25:
@@ -202,7 +204,8 @@ class Retriever:
             docs_all  = docs_mmr + docs_bm
             metas_all = metas_mmr + metas_bm
             if q and docs_all:
-                docs, metas = rerank(q, docs_all, metas_all, keep=min(process.settings.top_k.value, len(docs_all)))
+                keep_k = min(process.settings.top_k.value, len(docs_all))
+                docs, metas = rerank(q, docs_all, metas_all, keep=keep_k)
             else:
                 docs, metas = docs_all, metas_all
 
@@ -213,16 +216,16 @@ class Retriever:
                 docs  += img["documents"][0]
                 metas += img["metadatas"][0]
 
+            # Top-k slice (defensive)
             try:
                 top_k = int(getattr(process.settings, "top_k", None).value) if getattr(process.settings, "top_k", None) else len(docs)
             except Exception:
                 top_k = len(docs)
-
             n = min(top_k, len(docs))
             docs_out  = [docs[i]  for i in range(n)]
             metas_out = [metas[i] for i in range(n)]
 
-            # Build a compact, readable context block for the LLM api message
+            # Build context text for LLM
             def _label(meta, idx):
                 from pathlib import Path as _P
                 if meta.get("image_path") and meta.get("caption"):
@@ -233,8 +236,8 @@ class Retriever:
                 return f"Source {idx}: {src}{' ('+'/'.join(flags)+')' if flags else ''}"
 
             def _shorten(t, w=600):
-                import textwrap
-                return textwrap.shorten(" ".join((t or "").split()), width=w)
+                import textwrap as _tw
+                return _tw.shorten(" ".join((t or "").split()), width=w)
 
             blocks = []
             for i, (d, m) in enumerate(zip(docs_out, metas_out), 1):
@@ -248,7 +251,7 @@ class Retriever:
                 + "\n\nCite facts like (Source 2)."
             )
 
-            # Build citations list so LLM element prints them at the end
+            # Citations for UI (only implement in Chat LLM not LLM element)
             citations = []
             for m in metas_out:
                 src = m.get("source") or m.get("image_path")
@@ -259,24 +262,43 @@ class Retriever:
                     entry["page"] = m["page"]
                 citations.append(entry)
 
+            # Compose API messages and request id
+            api_in = other.get("api") or []
+            api_out = []
+            # Preserve any system messages from upstream
+            for msg in api_in:
+                if isinstance(msg, dict) and msg.get("role") == "system":
+                    api_out.append(msg)
+            # Add a user message containing the retrieval context
+            api_out.append({"role": "user", "content": context_text})
+
+            # Preserve request id (supports both camelCase and snake_case); ensure int
+            req_in = other.get("requestId", None)
+            if req_in is None:
+                req_in = other.get("request_id", None)
+            try:
+                rid = int(req_in) if req_in is not None else int(__import__("time").time() * 1000)
+            except Exception:
+                rid = int(__import__("time").time() * 1000)
+
             # Payload
             other_data = {
                 "type": "vector_search_result",
                 "value": [
                     {
-                        "document": docs_out, 
+                        "document": docs_out,
                         "metadata": metas_out,
                     }
                 ],
                 "message": other.get("message", q),
                 "metadata": other.get("metadata", {}),
-                "api": [
-                    {"role": "user", "content": context_text}
-                ],
-                "citations": citations,
+                "api": api_out,               # chat messages for LLM
+                "citations": citations,       # for UI
+                "requestId": rid,             # camelCase (API/webframe)
+                "request_id": rid,            # snake_case (defensive/legacy)
             }
 
-            # Optional debug
+            # Debug summary
             try:
                 print("[VectorRetrieval] sending other_data summary:", {
                     "type": other_data["type"],
@@ -284,14 +306,12 @@ class Retriever:
                     "has_api": isinstance(other_data.get("api"), list),
                     "n_citations": len(other_data.get("citations", [])),
                     "message": other_data.get("message", ""),
+                    "requestId": other_data.get("requestId"),
                 })
             except Exception as e:
                 print(f"[VectorRetrieval] preview failed: {e}")
 
-            # Emit as Frame with other_data
-            await outputs.default.send(
-                Frame(None, [], None, None, None, other_data)
-            )
+            await outputs.default.send(Frame(None, [], None, None, None, other_data))
             self.q.task_done()
 
 retriever = Retriever()
@@ -299,16 +319,17 @@ retriever = Retriever()
 process = CreateElement(Process(
     inputs=Inputs(),
     outputs=Outputs(),
-    settings=VSSettings(), 
+    settings=VSSettings(),
     metadata=ProcessMetadata(
         id="2a7a0b6a-7b84-4c57-8f1c-retrv000003",
         name="vector_retrieval",
         displayName="MM - Vector Retrieval",
-        version="0.19.0",
-        description="Consumes embeddings from input; performs MMR, BM25, CrossEncoder rerank, and CLIP; outputs structured results.",
+        version="0.21.0",
+        description="Consumes embeddings from input; performs MMR, BM25, CrossEncoder rerank, and CLIP; outputs structured results with requestId.",
     ),
     frame_receiver_func=retriever.frame_receiver,
     run_func=retriever.run
 ))
+
 
 

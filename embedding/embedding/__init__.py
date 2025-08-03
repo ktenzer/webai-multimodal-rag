@@ -59,14 +59,13 @@ IDLE_TIMEOUT = 3.0  # seconds
 
 class Embedder:
     def __init__(self):
-        # set in run() based on the user’s dropdown
         self.text_ef = None
         self._text_model_name = None
 
     async def run(self, process: Process):
         outputs = process.outputs
 
-        # Read settings (with safe defaults)
+        # Read settings (with defaults)
         text_model_name = (
             getattr(process.settings, "text_model", None)
             and process.settings.text_model.value
@@ -89,9 +88,8 @@ class Embedder:
             and process.settings.is_ingestion.value
         )
 
-        # INGESTION MODE: auto-exit after idle
+        # Ingestion Mode
         if ingest_mode:
-            IDLE_TIMEOUT = 3.0  # seconds
             processed_any = False
             ait = process.inputs.wait_for_frame()
 
@@ -131,6 +129,7 @@ class Embedder:
                     print("No text chunks to embed.")
                     txt_embs = []
 
+                # Image embeddings (optional)
                 img_embs, img_metas, img_docs_out = [], [], []
                 if img_docs:
                     print("Embedding images …")
@@ -159,17 +158,18 @@ class Embedder:
             print("Embedding (ingest): finished; exiting.")
             return 
 
-        # NON-INGESTION MODE: stay alive indefinitely
+
+        # Non-Ingestion Mode
         while True:
             ait = process.inputs.wait_for_frame()
             try:
                 while True:
                     slot, frame = await ait.__anext__()
 
-                    # extract message (api format or plain message or fallback to text)
+                    # Extract message (api format or plain message or fallback to text)
                     message = ""
+                    other = getattr(frame, "other_data", None) or {}
                     try:
-                        other = getattr(frame, "other_data", None) or {}
                         if isinstance(other, dict) and "api" in other:
                             user_msgs = [x for x in other.get("api", []) if isinstance(x, dict) and x.get("role") == "user"]
                             if user_msgs:
@@ -181,30 +181,48 @@ class Embedder:
 
                     if not message:
                         message = (getattr(frame, "text", "") or "").strip()
-
                     if not message:
-                        continue
+                        continue  # nothing to embed
 
                     # Compute embeddings
                     embs_vec = self.text_ef([message])[0]
                     db_path = Path(os.getenv("CHROMA_DIR", "./chroma_db/webai")).resolve()
 
-                    # Emit embeddings + message to downstream (vector retrieval)
+                    # Preserve upstream request id
+                    req_in = other.get("requestId", None)
+                    if req_in is None:
+                        req_in = other.get("request_id", None)
+                    rid = None
+                    try:
+                        rid = int(req_in) if req_in is not None else None
+                    except Exception:
+                        rid = None
+
+                    # Build output payload
+                    out_other = {
+                        "message": message,
+                        "embeddings": embs_vec,
+                        "vector_index_path": str(db_path),
+                    }
+
+                    # Pass through API chat array if present
+                    if isinstance(other.get("api"), list):
+                        out_other["api"] = other["api"]
+
+                    # Pass through request id in both forms
+                    if rid is not None:
+                        out_other["requestId"] = rid   
+                        out_other["request_id"] = rid  
+
+                    # Emit embeddings amd message to downstream (vector retrieval)
                     await outputs.default.send(
-                        Frame(
-                            None, [], None, None, None,
-                            {
-                                "message": message,
-                                "embeddings": embs_vec,
-                                "vector_index_path": str(db_path),
-                            },
-                        )
+                        Frame(None, [], None, None, None, out_other)
                     )
 
             except StopAsyncIteration:
-                # upstream temporarily closed, reattach
                 await asyncio.sleep(0.25)
                 continue
+
 
 embedder = Embedder()
 
@@ -216,9 +234,8 @@ process = CreateElement(Process(
         id="2a7a0b6a-7b84-4c57-8f1c-embed000001",
         name="embedding",
         displayName="MM - Embedding Element",
-        version="0.24.0",
-        description="Receives chunk file path, writes embeddings file, outputs that path."
+        version="0.25.0",
+        description="Receives chunk file path, writes embeddings file (ingest) or emits query embeddings (non-ingest)."
     ),
     run_func=embedder.run
 ))
-
