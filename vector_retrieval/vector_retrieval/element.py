@@ -30,7 +30,7 @@ class Settings(ElementSettings):
         name="top_k_mmr",
         display_name="Top K (MMR)",
         description="Number of Maximal Marginal Relevant (MMR)-selected candidates from the vector search before reranking.",
-        default=40,
+        default=20,
         min_value=1,
         step=1,
     )

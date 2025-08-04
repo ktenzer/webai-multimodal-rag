@@ -266,7 +266,7 @@ process = CreateElement(Process(
         id="2a7a0b6a-7b84-4c57-8f1c-retrv000003",
         name="vector_retrieval",
         displayName="MM - Vector Retrieval",
-        version="0.32.0",
+        version="0.33.0",
         description="Text-only retrieval (MMR+BM25+CrossEncoder). Sends a single text message to the LLM with labeled snippets.",
     ),
     frame_receiver_func=retriever.frame_receiver,
