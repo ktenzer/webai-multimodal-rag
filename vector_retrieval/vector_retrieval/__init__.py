@@ -135,6 +135,11 @@ class Retriever:
             except Exception:
                 K_FINAL = 3
 
+            debug = bool(
+                getattr(process.settings, "debug", None)
+                and process.settings.debug.value
+            )
+
             # normalize embeddings
             if isinstance(embeds_in, list) and embeds_in and isinstance(embeds_in[0], (float, int)):
                 query_emb = np.asarray(embeds_in, dtype=np.float32)
@@ -242,16 +247,19 @@ class Retriever:
             }
 
             # concise debug
-            try:
-                print("[VectorRetrieval] summary:", {
+            if debug:
+                # high-level summary
+                print("[VectorRetrieval DEBUG] summary:", {
                     "k": {"mmr": K_MMR, "bm25": K_BM25, "final": K_FINAL},
-                    "raw": len(docs_raw),
-                    "final": len(docs_out),
-                    "images_derived": sum(1 for m in metas_out if m.get("image_path")),
-                    "req": rid,
+                    "raw_candidates": len(docs_raw),
+                    "final_docs": len(docs_out),
+                    "images_from_meta": sum(1 for m in metas_out if m.get("image_path")),
+                    "request_id": rid,
                 })
-            except Exception:
-                pass
+                # and the actual retrieved snippets + metadata
+                print("[VectorRetrieval DEBUG] docs_out:")
+                for i, (doc, meta) in enumerate(zip(docs_out, metas_out), start=1):
+                    print(f"  {i}. {doc[:100]!r}  ← {meta}")
 
             await outputs.default.send(Frame(None, [], None, None, None, other_data))
             self.q.task_done()
@@ -266,7 +274,7 @@ process = CreateElement(Process(
         id="2a7a0b6a-7b84-4c57-8f1c-retrv000003",
         name="vector_retrieval",
         displayName="MM - Vector Retrieval",
-        version="0.33.0",
+        version="0.34.0",
         description="Text-only retrieval (MMR+BM25+CrossEncoder). Sends a single text message to the LLM with labeled snippets.",
     ),
     frame_receiver_func=retriever.frame_receiver,

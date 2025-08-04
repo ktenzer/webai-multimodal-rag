@@ -1,4 +1,4 @@
-from webai_element_sdk.element.settings import ElementSettings, NumberSetting, TextSetting
+from webai_element_sdk.element.settings import ElementSettings, NumberSetting, TextSetting, BoolSetting
 from webai_element_sdk.element.variables import ElementInputs, ElementOutputs, Input, Output
 from webai_element_sdk.comms.messages import Frame
 
@@ -42,4 +42,11 @@ class Settings(ElementSettings):
         default=10,
         min_value=1,
         step=1,
+    )
+    
+    debug = BoolSetting(
+        name="debug",
+        display_name="Debug",
+        description="If enabled, print detailed info about retrieved documents sent to LLM.",
+        default=False,
     )
