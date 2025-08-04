@@ -43,12 +43,3 @@ class Settings(ElementSettings):
         min_value=1,
         step=1,
     )
-
-    top_k_image = NumberSetting[int](
-        name="top_k_image",
-        display_name="Top K (Image)",
-        description="Number of image results to retrieve via CLIP.",
-        default=2,
-        min_value=1,
-        step=1,
-    )
