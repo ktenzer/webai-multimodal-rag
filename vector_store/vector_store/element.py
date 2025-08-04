@@ -1,4 +1,4 @@
-from webai_element_sdk.element.settings import ElementSettings, TextSetting
+from webai_element_sdk.element.settings import ElementSettings, TextSetting, NumberSetting
 from webai_element_sdk.element.variables import ElementInputs, Input
 from webai_element_sdk.comms.messages import Frame
 
@@ -13,4 +13,13 @@ class Settings(ElementSettings):
         default="",           
         required=False,
         hints=["folder_path"],  
+    )
+
+    max_batch_size = NumberSetting[int](
+        name="max_batch_size",
+        display_name="Max Chroma Batch Size",
+        description="Maximum number of items to send to Chroma in a single add() call",
+        default=2000,
+        min_value=1,
+        step=1,
     )
