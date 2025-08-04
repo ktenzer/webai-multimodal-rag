@@ -249,18 +249,20 @@ def load_docs(docs_dir: Path, img_store: Path | None, use_blip: bool, use_chartq
 
 def extract_pdf_images(pdf_path: Path, out_dir: Path) -> list[dict]:
     """
-    Extract embedded images from a PDF, but only save images that contain
-    usable alphanumeric text (via EasyOCR). Returns a list of entries:
-      { "page_content": "", "metadata": { "image_path", "source", "page" } }
+    Extract embedded images from a PDF, saving only those that contain usable
+    alphanumeric text (via EasyOCR). Robust to missing / exotic colorspaces:
+    renders the image region from the page into RGB first.
+
+    Returns: [{ "page_content": "", "metadata": { "image_path", "source", "page" } }]
     """
     out: list[dict] = []
     if not _HAVE_PYMUPDF:
         print(f"[OCR] PyMuPDF not available; skipping embedded images for {pdf_path.name}")
         return out
 
-    # Strict keep policy (always on)
-    MIN_OCR_CHARS = 6          # require at least this many characters after trimming
-    CONF_THRESHOLD = 0.30       # match doctr_ocr default
+    # strict keep policy
+    MIN_OCR_CHARS = 6
+    CONF_THRESHOLD = 0.30
 
     def _has_alnum_and_len(s: str) -> bool:
         s = (s or "").strip()
@@ -268,62 +270,67 @@ def extract_pdf_images(pdf_path: Path, out_dir: Path) -> list[dict]:
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    import io
-    import hashlib
+    import io, hashlib
     try:
-        import numpy as _np  # local import to keep drop-in simple
+        import numpy as _np
     except Exception:
         raise RuntimeError("numpy is required for OCR filtering of embedded images")
 
     doc = fitz.open(pdf_path)
-    saved = 0
-    kept = 0
-    skipped = 0
+    kept = skipped = 0
     try:
         for pno in range(len(doc)):
             page = doc[pno]
-            for img in page.get_images(full=True):
+            images = page.get_images(full=True)
+            if not images:
+                continue
+
+            for img_idx, img in enumerate(images):
                 xref = img[0]
-                pix0 = fitz.Pixmap(doc, xref)
-                pix  = pix0
-                try:
-                    # Normalize to RGB (drop alpha, handle CMYK/Indexed/etc.)
-                    need_convert = (
-                        (pix.colorspace is None)
-                        or (getattr(pix.colorspace, "n", 0) not in (1, 3))
-                        or pix.alpha
-                    )
-                    if need_convert:
-                        pix = fitz.Pixmap(fitz.csRGB, pix0)
 
-                    # Build a PIL image in-memory without writing the file first
+                # Prefer rendering the exact image rect(s) from the page (always RGB).
+                rects = page.get_image_rects(xref)
+                if not rects:
+                    rects = []
+
+                # we may have multiple rects reusing the same xref; iterate them
+                used_any_rect = False
+                for r_idx, rect in enumerate(rects):
                     try:
-                        pil_img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-                    except Exception:
-                        # Fallback route: encode to PNG in-memory then open with PIL
-                        bio = io.BytesIO(pix.tobytes("png"))
-                        pil_img = Image.open(bio).convert("RGB")
+                        mat = fitz.Matrix(2, 2)  # 2x scale for better OCR; adjust if needed
+                        pm = page.get_pixmap(clip=rect, matrix=mat, alpha=False, colorspace=fitz.csRGB)
+                        png_bytes = pm.tobytes("png")
+                        pil_img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+                    except Exception as e:
+                        # If rect render somehow fails, try next rect or fall back later
+                        print(f"[OCR] rect render failed (xref={xref}, page={pno+1}): {e}")
+                        continue
 
-                    # OCR on ndarray to decide keep/skip
+                    used_any_rect = True
+
+                    # Skip tiny assets / icons quickly
+                    if min(pil_img.size) < 16 or (pil_img.size[0] * pil_img.size[1]) < 400:
+                        skipped += 1
+                        continue
+
+                    # OCR to decide keep/skip
                     try:
                         ocr_results = ocr_model.readtext(_np.array(pil_img))
                         parts = [t for (_bbox, t, conf) in ocr_results
                                  if (conf is None) or (conf >= CONF_THRESHOLD)]
                         ocr_text = " ".join(parts)
-                    except Exception as e:
+                    except Exception:
                         ocr_text = ""
 
                     if not _has_alnum_and_len(ocr_text):
                         skipped += 1
                         continue  # DO NOT SAVE
 
-                    # Save only images that passed OCR filter
-                    name = hashlib.sha1(f"{pdf_path.name}:{pno}:{xref}".encode()).hexdigest() + ".png"
+                    # Save passing images (RGB PNG via PIL)
+                    name = hashlib.sha1(f"{pdf_path.name}:{pno}:{xref}:{r_idx}".encode()).hexdigest() + ".png"
                     fp = out_dir / name
-                    # Use PIL to save RGB PNG (robust to colorspace issues)
                     pil_img.save(fp, format="PNG", optimize=True)
                     kept += 1
-                    saved += 1
                     print(f"[OCR] saved embedded image (has text) -> {fp}")
 
                     out.append({
@@ -334,14 +341,65 @@ def extract_pdf_images(pdf_path: Path, out_dir: Path) -> list[dict]:
                             "page": pno + 1,
                         },
                     })
-                finally:
+
+                if used_any_rect:
+                    # We already handled all rects for this xref; next image
+                    continue
+
+                # ---- Fallback: no rects (rare). Render the whole page and crop the bbox of the xref if possible,
+                # or finally try to export the raw pixmap and PIL-convert it.
+                try:
+                    # Try raw export -> PIL as a last resort (can still fail; catch)
+                    pix = fitz.Pixmap(doc, xref)
                     try:
-                        pix0 = None
-                        pix  = None
+                        png_bytes = pix.tobytes("png")  # may raise unsupported colorspace
+                        pil_img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
                     except Exception:
-                        pass
+                        # Rasterize the whole page and hope the image occupies most of it
+                        mat = fitz.Matrix(2, 2)
+                        pm = page.get_pixmap(matrix=mat, alpha=False, colorspace=fitz.csRGB)
+                        png_bytes = pm.tobytes("png")
+                        pil_img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+                except Exception as e:
+                    print(f"[OCR] fallback render failed (xref={xref}, page={pno+1}): {e}")
+                    continue
+
+                # Skip tiny assets
+                if min(pil_img.size) < 16 or (pil_img.size[0] * pil_img.size[1]) < 400:
+                    skipped += 1
+                    continue
+
+                # OCR + keep
+                try:
+                    ocr_results = ocr_model.readtext(_np.array(pil_img))
+                    parts = [t for (_bbox, t, conf) in ocr_results
+                             if (conf is None) or (conf >= CONF_THRESHOLD)]
+                    ocr_text = " ".join(parts)
+                except Exception:
+                    ocr_text = ""
+
+                if not _has_alnum_and_len(ocr_text):
+                    skipped += 1
+                    continue
+
+                name = hashlib.sha1(f"{pdf_path.name}:{pno}:{xref}:fb".encode()).hexdigest() + ".png"
+                fp = out_dir / name
+                pil_img.save(fp, format="PNG", optimize=True)
+                kept += 1
+                print(f"[OCR] saved embedded image (fallback, has text) -> {fp}")
+
+                out.append({
+                    "page_content": "",
+                    "metadata": {
+                        "image_path": str(fp),
+                        "source": str(pdf_path),
+                        "page": pno + 1,
+                    },
+                })
+
     finally:
         doc.close()
+
     print(f"[OCR] {pdf_path.name}: kept {kept} / skipped {skipped} (saved to {out_dir})")
     return out
 
@@ -465,7 +523,7 @@ process = CreateElement(Process(
         id="2a7a0b6a-7b84-4c57-8f1c-ocr000000001",
         name="ocr",
         displayName="MM - OCR Element",
-        version="0.31.0",
+        version="0.34.0",
         description="Scans a folder, OCRs PDFs (and images), outputs path to JSON bundle with docs."
     ),
     run_func=ocr.run
