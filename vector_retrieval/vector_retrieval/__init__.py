@@ -65,13 +65,22 @@ def _shorten(t, w=600):
 
 def _label(meta, idx):
     from pathlib import Path as _P
-    # If the text came from an image, meta will usually have image_path + flags
+
+    # figure out the source filename
     if meta.get("image_path") and (meta.get("caption") or meta.get("ocr") or meta.get("chartqa")):
         src = _P(meta["image_path"]).name + " (from image)"
     else:
-        src = _P(meta.get("source", meta.get("image_path","unknown"))).name
+        src = _P(meta.get("source", meta.get("image_path", "unknown"))).name
+
+    # flags like table_md, ocr, etc.
     flags = [k for k in ("table_md","table_json","table_row","chartqa","ocr","caption") if meta.get(k)]
-    return f"Source {idx}: {src}{' ('+'/'.join(flags)+')' if flags else ''}"
+    flag_str = f" ({'/'.join(flags)})" if flags else ""
+
+    # add page info if present
+    page = meta.get("page")
+    page_str = f" (page {page})" if page is not None else ""
+
+    return f"Source {idx}: {src}{flag_str}{page_str}"
 
 def rerank(query: str, docs: List[str], metas: List[dict], keep: int):
     scores = reranker.predict([(query, d if d else " ") for d in docs])
@@ -177,7 +186,7 @@ class Retriever:
             embs_raw  = np.array(txt["embeddings"][0], dtype=np.float32)
 
             # MMR
-            docs_mmr, metas_mmr = mmr_select(query_emb, embs_raw, docs_raw, metas_raw, k=K_MMR, weight=0.6)
+            docs_mmr, metas_mmr = mmr_select(query_emb, embs_raw, docs_raw, metas_raw, k=K_MMR, weight=0.4)
 
             # BM25
             bm25, corpus_docs, corpus_metas = bm25_cache.get(client, chroma_dir)
@@ -191,8 +200,13 @@ class Retriever:
             docs_all  = docs_mmr + docs_bm
             metas_all = metas_mmr + metas_bm
             if q and docs_all:
-                keep_k = min(K_FINAL, len(docs_all))
-                docs, metas = rerank(q, docs_all, metas_all, keep=keep_k)
+                scores = reranker.predict([(q, d or " ") for d in docs_all])
+                # if the highest rerank score is too low, fall back to pure BM25 hits
+                if max(scores) < 0.35 and docs_bm:
+                    docs, metas = docs_bm[:K_FINAL], metas_bm[:K_FINAL]
+                else:
+                    keep_k = min(K_FINAL, len(docs_all))
+                    docs, metas = rerank(q, docs_all, metas_all, keep=keep_k)
             else:
                 docs, metas = docs_all, metas_all
 
@@ -207,11 +221,29 @@ class Retriever:
                 snippet = _shorten(d, 600)
                 blocks.append(f"{_label(m, i)}\n{snippet}")
 
-            context_text = (
-                "Use ONLY the sources below. Cite facts like (Source 2).\n"
-                f"Question: {q}\n\n"
-                + "\n\n".join(blocks)
-            )
+            # assemble citation lines
+            citation_lines = []
+            for m in metas_out:
+                src = Path(m.get("source") or m.get("image_path", "")).name
+                page = m.get("page")
+                if page is not None:
+                    citation_lines.append(f"{src}, page {page}")
+                else:
+                    citation_lines.append(f"{src}")
+
+            # final prompt to LLM: no inline citations, only end-of-answer list
+            context_text = "\n".join([
+                "You are given the following sources. Answer the question using ONLY these sources.",
+                "Do **not** put inline citations like (Source 1).",
+                "At the very end of your answer, include a “Citation(s):” section listing each source and page.",
+                "",
+                f"Question: {q}",
+                "",
+                *blocks,
+                "",
+                "Citation(s):\n",
+                *citation_lines
+            ])
 
             # citations (no image_url / pixels)
             citations = []
@@ -241,7 +273,7 @@ class Retriever:
                 "message": other.get("message", q),
                 "metadata": other.get("metadata", {}),
                 "api": api_out,          # <-- text only
-                "citations": citations,  # <-- no image_url
+                #"citations": citations,  # <-- no image_url
                 "requestId": rid,
                 "request_id": rid,
             }
@@ -274,7 +306,7 @@ process = CreateElement(Process(
         id="2a7a0b6a-7b84-4c57-8f1c-retrv000003",
         name="vector_retrieval",
         displayName="MM - Vector Retrieval",
-        version="0.34.0",
+        version="0.41.0",
         description="Text-only retrieval (MMR+BM25+CrossEncoder). Sends a single text message to the LLM with labeled snippets.",
     ),
     frame_receiver_func=retriever.frame_receiver,

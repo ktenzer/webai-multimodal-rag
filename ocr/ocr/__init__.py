@@ -129,6 +129,20 @@ def csv_to_sentences(raw_csv, hdr):
         out.append("Row -> " + ", ".join(f"{h.strip()}: {v.strip()}" for h, v in zip(hdr, row)))
     return out
 
+def chunk_text(text: str, max_words: int = 500, overlap: int = 100) -> list[str]:
+    words = text.split()
+    if len(words) <= max_words:
+        return [text]
+    chunks = []
+    start = 0
+    while start < len(words):
+        end = min(start + max_words, len(words))
+        chunks.append(" ".join(words[start:end]))
+        if end == len(words):
+            break
+        start += max_words - overlap
+    return chunks
+
 def tables_docs(path: Path):
     docs = []
     try:
@@ -213,19 +227,34 @@ def load_docs(docs_dir: Path, img_store: Path | None, use_blip: bool, use_chartq
 
         # ---- PDFs (extract text + tables + images) ----
         elif fp.suffix.lower() == ".pdf":
-            # PDF text via unstructured
-            text_docs.append({"page_content": ocr_pdf(fp), "metadata": {"source": str(fp)}})
+            # --- per-page OCR via pdfplumber, so each chunk has a 'page' field ---
+            try:
+                import pdfplumber
+                with pdfplumber.open(str(fp)) as pdf:
+                    for page_num, page in enumerate(pdf.pages, start=1):
+                        txt = page.extract_text() or ""
+                        if txt.strip():
+                            for sub in chunk_text(txt, max_words=500, overlap=100):
+                                text_docs.append({
+                                "page_content": sub,
+                                "metadata": {"source": str(fp), "page": page_num}
+                                })
+            except Exception:
+                # fallback to single-chunk if pdfplumber fails
+                text = ocr_pdf(fp)
+                text_docs.append({
+                    "page_content": text,
+                    "metadata": {"source": str(fp), "page": None}
+                })
 
-            # tables as markdown/json/rows
+            # tables (they already include 'page' in metadata)
             text_docs.extend(tables_docs(fp))
 
-            # embedded images (normalized RGB PNGs in img_store)
+            # embedded images (existing logic unchanged)
             if img_store is not None:
                 extracted = extract_pdf_images(fp, img_store)
-                # record images (for auditing); will be dropped before output
                 img_docs.extend(extracted)
 
-                # caption/OCR for each extracted image -> text docs
                 for img_doc in extracted:
                     img_fp = Path(img_doc["metadata"]["image_path"])
                     cap   = safe_blip_caption(img_fp, enable=use_blip)
@@ -234,8 +263,12 @@ def load_docs(docs_dir: Path, img_store: Path | None, use_blip: bool, use_chartq
 
                     combo = " • ".join(t for t in (cap, chart, ocr) if t)
                     if combo:
-                        meta = {**img_doc["metadata"], "caption": bool(cap), "chartqa": bool(chart), "ocr": bool(ocr)}
-                        text_docs.append({"page_content": combo, "metadata": meta})
+                        meta = {**img_doc["metadata"], "caption": bool(cap),
+                                "chartqa": bool(chart), "ocr": bool(ocr)}
+                        text_docs.append({
+                            "page_content": combo,
+                            "metadata": meta
+                        })
 
                 print(f"[OCR] image_store_folder -> {img_store}")
 
@@ -523,7 +556,7 @@ process = CreateElement(Process(
         id="2a7a0b6a-7b84-4c57-8f1c-ocr000000001",
         name="ocr",
         displayName="MM - OCR Element",
-        version="0.34.0",
+        version="0.37.0",
         description="Scans a folder, OCRs PDFs (and images), outputs path to JSON bundle with docs."
     ),
     run_func=ocr.run

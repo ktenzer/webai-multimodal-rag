@@ -1,5 +1,5 @@
 --extra-index-url https://gitlab.com/api/v4/projects/49121232/packages/pypi/simple
-webai_element_sdk==0.10.0
+webai_element_sdk==0.10.4
 
 torch==2.6.0
 torchvision==0.21.0

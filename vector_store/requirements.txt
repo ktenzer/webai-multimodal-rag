@@ -1,4 +1,4 @@
 --extra-index-url https://gitlab.com/api/v4/projects/49121232/packages/pypi/simple
-webai_element_sdk==0.10.0
+webai_element_sdk==0.10.4
 
 chromadb==1.0.15

@@ -130,7 +130,7 @@ process = CreateElement(Process(
         id="2a7a0b6a-7b84-4c57-8f1c-store000003",
         name="vector_store",
         displayName="MM - Vector Store Element",
-        version="0.16.0",
+        version="0.17.0",
         description="Consumes embeddings bundle filename and writes to Chroma; cleans up tmp files."
     ),
     run_func=writer.run

@@ -94,7 +94,7 @@ process = CreateElement(Process(
         id="2a7a0b6a-7b84-4c57-8f1c-chunk0000001",
         name="chunking",
         displayName="MM - Chunking Element",
-        version="0.26.0",  # bump to redeploy
+        version="0.27.0",  # bump to redeploy
         description="Splits OCR text docs into chunks; outputs path to chunk bundle."
     ),
     run_func=chunker.run
