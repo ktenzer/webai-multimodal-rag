@@ -14,7 +14,7 @@ import pdfplumber
 from unstructured.partition.auto import partition
 
 try:
-    import fitz  # PyMuPDF (best for embedded images)
+    import fitz 
     _HAVE_PYMUPDF = True
 except Exception:
     _HAVE_PYMUPDF = False
@@ -189,7 +189,7 @@ def classify_visual_type(image_path: str) -> str:
 def has_text(s: str, min_chars: int) -> bool:
     return bool(ALNUM_RE.search(s)) and (len(s.strip()) >= min_chars)
 
-def load_docs(docs_dir: Path, img_store: Path | None, use_blip: bool, use_chartqa: bool):
+def load_docs(docs_dir: Path, img_store: Path | None, use_blip: bool, use_chartqa: bool, extract_images: bool):
     """
     Builds:
       - text_docs: list of {"page_content": <text>, "metadata": {...}}
@@ -227,9 +227,7 @@ def load_docs(docs_dir: Path, img_store: Path | None, use_blip: bool, use_chartq
 
         # ---- PDFs (extract text + tables + images) ----
         elif fp.suffix.lower() == ".pdf":
-            # --- per-page OCR via pdfplumber, so each chunk has a 'page' field ---
             try:
-                import pdfplumber
                 with pdfplumber.open(str(fp)) as pdf:
                     for page_num, page in enumerate(pdf.pages, start=1):
                         txt = page.extract_text() or ""
@@ -252,23 +250,24 @@ def load_docs(docs_dir: Path, img_store: Path | None, use_blip: bool, use_chartq
 
             # embedded images (existing logic unchanged)
             if img_store is not None:
-                extracted = extract_pdf_images(fp, img_store)
-                img_docs.extend(extracted)
+                if extract_images and img_store is not None:
+                    extracted = extract_pdf_images(fp, img_store)
+                    img_docs.extend(extracted)
 
-                for img_doc in extracted:
-                    img_fp = Path(img_doc["metadata"]["image_path"])
-                    cap   = safe_blip_caption(img_fp, enable=use_blip)
-                    chart = safe_chart_caption(img_fp, enable=use_chartqa)
-                    ocr   = safe_doctr_ocr(img_fp)
+                    for img_doc in extracted:
+                        img_fp = Path(img_doc["metadata"]["image_path"])
+                        cap   = safe_blip_caption(img_fp, enable=use_blip)
+                        chart = safe_chart_caption(img_fp, enable=use_chartqa)
+                        ocr   = safe_doctr_ocr(img_fp)
 
-                    combo = " • ".join(t for t in (cap, chart, ocr) if t)
-                    if combo:
-                        meta = {**img_doc["metadata"], "caption": bool(cap),
-                                "chartqa": bool(chart), "ocr": bool(ocr)}
-                        text_docs.append({
-                            "page_content": combo,
-                            "metadata": meta
-                        })
+                        combo = " • ".join(t for t in (cap, chart, ocr) if t)
+                        if combo:
+                            meta = {**img_doc["metadata"], "caption": bool(cap),
+                                    "chartqa": bool(chart), "ocr": bool(ocr)}
+                            text_docs.append({
+                                "page_content": combo,
+                                "metadata": meta
+                            })
 
                 print(f"[OCR] image_store_folder -> {img_store}")
 
@@ -522,9 +521,10 @@ class OCRElement:
         # NEW: read toggles from element settings
         use_blip    = bool(getattr(settings, "use_blip", None) and settings.use_blip.value)
         use_chartqa = bool(getattr(settings, "use_chartqa", None) and settings.use_chartqa.value)
+        extract_images = bool(getattr(settings, "extract_images", None) and settings.extract_images.value)
 
         # Build text_docs and img_docs
-        text_docs, img_docs = load_docs(docs_dir, img_store=img_store, use_blip=use_blip, use_chartqa=use_chartqa)
+        text_docs, img_docs = load_docs(docs_dir, img_store=img_store, use_blip=use_blip, use_chartqa=use_chartqa, extract_images=extract_images)
 
         # Optional: dedupe text
         text_docs = dedupe_text_docs(text_docs)
@@ -556,7 +556,7 @@ process = CreateElement(Process(
         id="2a7a0b6a-7b84-4c57-8f1c-ocr000000001",
         name="ocr",
         displayName="MM - OCR Element",
-        version="0.37.0",
+        version="0.41.0",
         description="Scans a folder, OCRs PDFs (and images), outputs path to JSON bundle with docs."
     ),
     run_func=ocr.run

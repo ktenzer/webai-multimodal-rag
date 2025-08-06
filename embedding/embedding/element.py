@@ -23,7 +23,6 @@ class Settings(ElementSettings):
         default="BAAI/bge-base-en-v1.5",
         description="Sentence-transformers model for text embeddings.",
         valid_values=[
-            "sentence-transformers/all-MiniLM-L6-v2",
             "BAAI/bge-small-en-v1.5",
             "BAAI/bge-base-en-v1.5",
             "BAAI/bge-large-en-v1.5",
