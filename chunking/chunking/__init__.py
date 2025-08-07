@@ -118,18 +118,18 @@ def semantic_split(
         if not sents:
             continue
 
-        # precompute embeddings
+        # Precompute embeddings
         embs = embedder.encode(sents, convert_to_tensor=True)
 
         i = 0
         while i < len(sents):
             j = min(i + window, len(sents))
             chunk_emb = embs[i:j].mean(dim=0, keepdim=True)
-            # check if on average it’s still coherent
+            # Check if on average it’s still coherent
             avg_sim = float(cos_sim(chunk_emb, embs[i:j]).mean())
             text = " ".join(sents[i:j]).strip()
 
-            # enforce token budget
+            # Enforce token budget
             while token_count(text, token_model) > max_tokens and " " in text:
                 text = text.rsplit(" ", 1)[0]
 
@@ -139,7 +139,7 @@ def semantic_split(
                 md["avg_sim"] = round(avg_sim, 2)
                 out.append(Document(page_content=text, metadata=md))
 
-            # advance
+            # Advance chunk
             i += window - overlap
 
     return out
@@ -239,7 +239,7 @@ process = CreateElement(Process(
         id="2a7a0b6a-7b84-4c57-8f1c-chunk0000001",
         name="chunking",
         displayName="MM - Chunking",
-        version="0.66.0",
+        version="0.67.0",
         description="Splits OCR text docs into highly coherent chunks for RAG"
     ),
     run_func=Chunker().run

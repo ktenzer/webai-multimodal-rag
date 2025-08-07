@@ -240,7 +240,7 @@ process = CreateElement(Process(
         id="2a7a0b6a-7b84-4c57-8f1c-embed000001",
         name="embedding",
         displayName="MM - Embedding",
-        version="0.29.0",
+        version="0.30.0",
         description="Receives chunk file path, writes embeddings file (ingest) or emits query embeddings (non-ingest)"
     ),
     run_func=embedder.run

@@ -1,7 +1,6 @@
 import os, sys, time, textwrap, mimetypes, warnings, logging, csv, io, re, json, tempfile
 from pathlib import Path
 from typing import List
-from dotenv import load_dotenv
 
 from webai_element_sdk.element import CreateElement
 from webai_element_sdk.process import Process, ProcessMetadata
@@ -27,8 +26,6 @@ from transformers import (
 
 from .element import Outputs, Settings
 
-# ---- original env/quieting bits (kept) ----
-load_dotenv(override=True)
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 warnings.filterwarnings("ignore", category=UserWarning, module="transformers")
 logging.getLogger("transformers").setLevel(logging.ERROR)
@@ -38,7 +35,7 @@ VISION_LABELS = [
 ]
 ALNUM_RE = re.compile(r"[A-Za-z0-9]")
 
-# ---- models per original ----
+# Models
 CLIP_MODEL    = "openai/clip-vit-base-patch32"
 BLIP_MODEL    = "Salesforce/blip-image-captioning-base"
 CHARTQA_MODEL = "google/deplot"
@@ -59,7 +56,7 @@ _ocr_langs   = [s.strip() for s in os.getenv("OCR_LANGS", "en").split(",") if s.
 ocr_model    = easyocr.Reader(_ocr_langs, gpu=_easyocr_gpu, verbose=False)
 print("Models ready\n")
 
-# ---- helper functions from original ----
+# Helpers
 def blip_caption(path: Path, device=None) -> str:
     img = Image.open(path).convert("RGB")
     inputs = blip_proc(images=img, return_tensors="pt")
@@ -89,7 +86,6 @@ def doctr_ocr(path: Path, conf_threshold: float = 0.30) -> str:
     
 def ocr_pdf(path: Path):
     print(f"OCR {path.name}")
-    # Use 'fast' instead of 'high_res' to avoid pdf2image/Poppler; keeps everything else the same.
     elems = partition(filename=str(path), strategy="fast", languages=["eng"])
     return "\n".join(e.text for e in elems if e.text)
 
@@ -103,7 +99,6 @@ def safe_blip_caption(path: Path, enable: bool) -> str:
         return ""
 
 def safe_chart_caption(path: Path, enable: bool) -> str:
-    """Run ChartQA only if enabled AND the image looks chart/diagram/table-like."""
     if not enable:
         return ""
     try:
@@ -118,7 +113,6 @@ def safe_doctr_ocr(path: Path) -> str:
     try:
         return doctr_ocr(path)
     except Exception as e:
-        # print(f"OCR on image failed for {path.name}: {e}")
         return ""
 
 def csv_to_sentences(raw_csv, hdr):
@@ -168,7 +162,6 @@ def tables_docs(path: Path):
     return docs
 
 def classify_visual_type(image_path: str) -> str:
-    """Return best label from _VISION_LABELS using CLIP zero-shot."""
     try:
         img = Image.open(image_path).convert("RGB")
         inputs = clip_proc(text=[f"a {lbl}" for lbl in VISION_LABELS], images=img, return_tensors="pt", padding=True)
@@ -183,19 +176,12 @@ def classify_visual_type(image_path: str) -> str:
             idx = int(torch.argmax(sims).cpu().item())
         return VISION_LABELS[idx]
     except Exception as e:
-        # If classification fails, return a safe default
         return "natural photo"
 
 def has_text(s: str, min_chars: int) -> bool:
     return bool(ALNUM_RE.search(s)) and (len(s.strip()) >= min_chars)
 
 def load_docs(docs_dir: Path, img_store: Path | None, use_blip: bool, use_chartqa: bool, extract_images: bool):
-    """
-    Builds:
-      - text_docs: list of {"page_content": <text>, "metadata": {...}}
-      - img_docs:  list of {"page_content": "", "metadata": {"image_path": ...}}
-    We always create a text entry for images from OCR (+optional captions/chart).
-    """
     text_docs, img_docs = [], []
 
     for fp in docs_dir.rglob("*"):
@@ -203,9 +189,8 @@ def load_docs(docs_dir: Path, img_store: Path | None, use_blip: bool, use_chartq
             continue
         mime = mimetypes.guess_type(fp)[0] or ""
 
-        # ---- Stand-alone image files ----
+        # Standalone images
         if mime.startswith("image"):
-            # keep image record (if you still want to archive), but we will not send images downstream
             img_docs.append({"page_content": "", "metadata": {"image_path": str(fp)}})
 
             # create the text doc for this image (caption + OCR + chart)
@@ -225,7 +210,7 @@ def load_docs(docs_dir: Path, img_store: Path | None, use_blip: bool, use_chartq
                     }
                 })
 
-        # ---- PDFs (extract text + tables + images) ----
+        # PDFs (extract text + tables + images)
         elif fp.suffix.lower() == ".pdf":
             try:
                 with pdfplumber.open(str(fp)) as pdf:
@@ -245,10 +230,10 @@ def load_docs(docs_dir: Path, img_store: Path | None, use_blip: bool, use_chartq
                     "metadata": {"source": str(fp), "page": None}
                 })
 
-            # tables (they already include 'page' in metadata)
+            # Tables
             text_docs.extend(tables_docs(fp))
 
-            # embedded images (existing logic unchanged)
+            # Embedded images
             if img_store is not None:
                 if extract_images and img_store is not None:
                     extracted = extract_pdf_images(fp, img_store)
@@ -271,7 +256,7 @@ def load_docs(docs_dir: Path, img_store: Path | None, use_blip: bool, use_chartq
 
                 print(f"[OCR] image_store_folder -> {img_store}")
 
-        # ---- Plain text files ----
+        # Plain text files
         elif fp.suffix.lower() in {".txt", ".md"}:
             print(f"Load {fp.name}")
             text_docs.append({"page_content": fp.read_text(), "metadata": {"source": str(fp)}})
@@ -280,13 +265,6 @@ def load_docs(docs_dir: Path, img_store: Path | None, use_blip: bool, use_chartq
     return text_docs, img_docs
 
 def extract_pdf_images(pdf_path: Path, out_dir: Path) -> list[dict]:
-    """
-    Extract embedded images from a PDF, saving only those that contain usable
-    alphanumeric text (via EasyOCR). Robust to missing / exotic colorspaces:
-    renders the image region from the page into RGB first.
-
-    Returns: [{ "page_content": "", "metadata": { "image_path", "source", "page" } }]
-    """
     out: list[dict] = []
     if not _HAVE_PYMUPDF:
         print(f"[OCR] PyMuPDF not available; skipping embedded images for {pdf_path.name}")
@@ -375,13 +353,11 @@ def extract_pdf_images(pdf_path: Path, out_dir: Path) -> list[dict]:
                     })
 
                 if used_any_rect:
-                    # We already handled all rects for this xref; next image
                     continue
 
-                # ---- Fallback: no rects (rare). Render the whole page and crop the bbox of the xref if possible,
-                # or finally try to export the raw pixmap and PIL-convert it.
+                # Fallback: no rects (rare). Render entire page.
                 try:
-                    # Try raw export -> PIL as a last resort (can still fail; catch)
+                    # Try raw export to PIL as a last resort 
                     pix = fitz.Pixmap(doc, xref)
                     try:
                         png_bytes = pix.tobytes("png")  # may raise unsupported colorspace
@@ -401,7 +377,7 @@ def extract_pdf_images(pdf_path: Path, out_dir: Path) -> list[dict]:
                     skipped += 1
                     continue
 
-                # OCR + keep
+                # OCR
                 try:
                     ocr_results = ocr_model.readtext(_np.array(pil_img))
                     parts = [t for (_bbox, t, conf) in ocr_results
@@ -436,11 +412,6 @@ def extract_pdf_images(pdf_path: Path, out_dir: Path) -> list[dict]:
     return out
 
 def caption_extracted_images(img_docs: list[dict]) -> list[dict]:
-    """
-    For each extracted image, generate a text entry (caption/chartqa/ocr) so it is
-    searchable by text retrieval, mirroring the behavior for 'native' images.
-    Returns a list of text-doc dicts in the same shape as other text_docs.
-    """
     text_entries: list[dict] = []
     for d in img_docs:
         try:
@@ -518,7 +489,7 @@ class OCRElement:
         img_store = Path(img_store_val.value).expanduser().resolve()
         img_store.mkdir(parents=True, exist_ok=True)
 
-        # NEW: read toggles from element settings
+        # Read toggles from element settings
         use_blip    = bool(getattr(settings, "use_blip", None) and settings.use_blip.value)
         use_chartqa = bool(getattr(settings, "use_chartqa", None) and settings.use_chartqa.value)
         extract_images = bool(getattr(settings, "extract_images", None) and settings.extract_images.value)
@@ -529,7 +500,7 @@ class OCRElement:
         # Optional: dedupe text
         text_docs = dedupe_text_docs(text_docs)
 
-        # Write tmp json bundle — IMPORTANT: do not pass images downstream
+        # Write tmp json bundle, don't pass images downstream
         fd, tmp_path = tempfile.mkstemp(prefix="ocr_bundle_", suffix=".json", dir="/tmp")
         os.close(fd)
         with open(tmp_path, "w", encoding="utf-8") as f:
@@ -556,7 +527,7 @@ process = CreateElement(Process(
         id="2a7a0b6a-7b84-4c57-8f1c-ocr000000001",
         name="ocr",
         displayName="MM - OCR",
-        version="0.43.0",
+        version="0.44.0",
         description="Scans a folder, OCRs PDFs (and images), outputs path to JSON bundle with docs."
     ),
     run_func=ocr.run

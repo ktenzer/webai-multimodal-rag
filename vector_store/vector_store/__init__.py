@@ -19,7 +19,6 @@ IDLE_TIMEOUT = 3.0
 def _add_in_batches(
     col, docs, metas, embs, *, id_prefix="t", max_batch=None
 ):
-    # ... your existing batch logic unchanged ...
     if not docs:
         return
     n = len(docs)
@@ -36,7 +35,6 @@ def _add_in_batches(
         )
 
 def build_stores_chroma(payload, client, max_batch):
-    """Exactly your existing Chroma logic."""
     t0 = time.time()
     txt_col = client.get_or_create_collection("text")
     _add_in_batches(
@@ -62,22 +60,13 @@ def build_stores_chroma(payload, client, max_batch):
     print(f"[VectorStore][Chroma] Done in {(time.time()-t0):.1f}s")
 
 def build_stores_postgresml(payload, conn, table_name):
-    """
-    Assumes pgvector (vector) extension is available.
-    Auto-creates:
-      - extension pgvector
-      - table <table_name> with (id TEXT PRIMARY KEY, document TEXT, metadata JSONB, embedding VECTOR)
-    Then upserts all docs.
-    """
     t0 = time.time()
     docs = payload.get("txt_docs", []) or []
     metas = payload.get("txt_metadatas", []) or []
     embs = payload.get("txt_embeddings", []) or []
 
     cur = conn.cursor()
-    # 1) enable pgvector extension if not already
     cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-    # 2) create your target table if missing
     cur.execute(f"""
       CREATE TABLE IF NOT EXISTS {table_name} (
         id TEXT PRIMARY KEY,
@@ -86,7 +75,6 @@ def build_stores_postgresml(payload, conn, table_name):
         embedding VECTOR
       );
     """)
-    # 3) insert (ON CONFLICT DO NOTHING)
     for i, (doc, meta, emb) in enumerate(zip(docs, metas, embs)):
         rec_id = f"t{i}"
         cur.execute(
@@ -99,7 +87,7 @@ def build_stores_postgresml(payload, conn, table_name):
                 rec_id,
                 doc,
                 json.dumps(meta, ensure_ascii=False),
-                emb,  # pgvector psycopg2 adapter will accept a Python list
+                emb,
             ),
         )
     conn.commit()
@@ -134,6 +122,8 @@ class StoreWriter:
                 payload = json.load(f)
 
             store_type = settings.vector_store_type.value
+
+            # Chromadb
             if store_type == "chromadb":
                 db_dir = Path(settings.vector_db_folder_path.value or "").expanduser()
                 db_dir.mkdir(parents=True, exist_ok=True)
@@ -143,7 +133,8 @@ class StoreWriter:
                 )
                 build_stores_chroma(payload, client, settings.max_batch_size.value)
 
-            else:  # postgresml
+            # PostgresML
+            else:
                 host   = settings.pgml_host.value
                 port   = settings.pgml_port.value
                 db     = settings.pgml_db.value
@@ -186,7 +177,7 @@ process = CreateElement(
             id="2a7a0b6a-7b84-4c57-8f1c-store000003",
             name="vector_store",
             displayName="MM - Vector Store",
-            version="0.25.0",
+            version="0.26.0",
             description="Writes embeddings to Chroma or PostgresML",
         ),
         run_func=writer.run,

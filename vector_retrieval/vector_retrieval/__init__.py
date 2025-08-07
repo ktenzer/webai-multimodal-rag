@@ -145,7 +145,7 @@ class Retriever:
 
             store_type = settings.vector_store_type.value
 
-            # ── Chroma ─────────────────────────────────────────────────────────────
+            # ChromaDB
             n_initial = max(60, K_MMR + K_BM25 + 10)
             if store_type == "chromadb":
                 db_dir = Path(os.path.expanduser(settings.vector_db_folder_path.value)).resolve()
@@ -168,7 +168,7 @@ class Retriever:
                 docs_raw, metas_raw = rec["documents"][0], rec["metadatas"][0]
                 embs_raw = np.array(rec["embeddings"][0], dtype=np.float32)
 
-            # ── PostgresML ─────────────────────────────────────────────────────────
+            # PostgresML
             else:
                 host   = settings.pgml_host.value
                 port   = settings.pgml_port.value
@@ -195,8 +195,8 @@ class Retriever:
                     LIMIT %s
                     """,
                     (
-                        q_emb.tolist(),   # your float list
-                        n_initial,        # same as Chroma
+                        q_emb.tolist(), 
+                        n_initial, 
                     ),
                 )
                 rows = cur.fetchall()
@@ -305,7 +305,7 @@ process = CreateElement(
             id="2a7a0b6a-7b84-4c57-8f1c-retrv000003",
             name="vector_retrieval",
             displayName="MM - Vector Retrieval",
-            version="0.52.0",
+            version="0.53.0",
             description="Retrieves via Chroma or PostgresML",
         ),
         frame_receiver_func=retriever.frame_receiver,
