@@ -235,7 +235,7 @@ class Retriever:
                 docs_bm  = [corpus_docs[i]  for i in idxs]
                 metas_bm = [corpus_metas[i] for i in idxs]
 
-            # merge + rerank
+            # Merge + rerank
             docs_all, metas_all = docs_mmr + docs_bm, metas_mmr + metas_bm
             if q_text and docs_all:
                 scores = reranker.predict([(q_text, d or " ") for d in docs_all])
@@ -246,50 +246,92 @@ class Retriever:
             else:
                 docs, metas = docs_all, metas_all
 
-            # final top-K
+            # Final top-K
             n = min(K_FINAL, len(docs))
             docs_out  = docs[:n]
             metas_out = metas[:n]
 
-            # build prompt
+            # Build prompt
             blocks = [f"{_label(m,i+1)}\n{_shorten(d,600)}"
                       for i,(d,m) in enumerate(zip(docs_out, metas_out))]
-            citation_lines = [
-                f"{Path(m.get('source') or m.get('image_path','')).name}"
-                + (f", page {m['page']}" if m.get("page") is not None else "")
-                for m in metas_out
-            ]
+            
+            # Build plain text context for LLM
+            blocks = []
+            for i, (d, m) in enumerate(zip(docs_out, metas_out), 1):
+                snippet = _shorten(d, 600)
+                blocks.append(f"{_label(m, i)}\n{snippet}")
+
+            # Assemble citation lines
+            citation_lines = []
+            for m in metas_out:
+                src = Path(m.get("source") or m.get("image_path", "")).name
+                page = m.get("page")
+                if page is not None:
+                    citation_lines.append(f"{src}, page {page}")
+                else:
+                    citation_lines.append(f"{src}")
+
+            # Final prompt to LLM: no inline citations, only end-of-answer list
             context = "\n".join([
-                "You are given the following sources. Answer using ONLY these.",
-                "Do NOT use inline citations.",
+                "You are given the following sources. Answer the question using ONLY these sources.",
+                "Do **not** put inline citations like (Source 1).",
+                "At the very end of your answer, include a “Citation(s):” section listing each source and page.",
+                "",
                 f"Question: {q_text}",
+                "",
                 *blocks,
                 "",
-                "Citation(s):",
+                "Citation(s):\n",
                 *citation_lines
             ])
 
-            req_id = other.get("request_id") or other.get("requestId")
-            if req_id is None:
-                req_id = int(asyncio.get_event_loop().time() * 1000)
+            # Citations (no image_url / pixels)
+            citations = []
+            for m in metas_out:
+                entry = {}
+                if m.get("source"): entry["source"] = str(m["source"])
+                if "page" in m and m["page"] is not None: entry["page"] = m["page"]
+                if not entry and m.get("image_path"):
+                    entry["source"] = str(m["image_path"])  # still a useful reference
+                if entry:
+                    citations.append(entry)
+
+             # Compose API messages and request id
+            api_in = other.get("api") or []
+            api_out = [msg for msg in api_in if isinstance(msg, dict) and msg.get("role") == "system"]
+            api_out.append({"role": "user", "content": context})
+
+            req_in = other.get("requestId", None) or other.get("request_id", None)
+            try:
+                rid = int(req_in) if req_in is not None else int(__import__("time").time() * 1000)
+            except Exception:
+                rid = int(__import__("time").time() * 1000)
 
             other_data = {
                 "type": "vector_search_result",
                 "value": [{"document": docs_out, "metadata": metas_out}],
-                "message": q_text,
-                "api": [{"role": "user", "content": context}],
-                # include both keys so the API element finds it
-                "request_id": req_id,
-                "requestId": req_id,
-            }
+                "message": other.get("message", q_text),
+                "metadata": other.get("metadata", {}),
+                "api": api_out,          # <-- text only
+                #"citations": citations,  # <-- no image_url
+                "requestId": rid,
+                "request_id": rid,
+            }           
 
+            # concise debug
             if debug:
-                print("[VectorRetrieval DEBUG]", {
-                    "store": store_type,
-                    "mmr":   len(docs_mmr),
-                    "bm25":  len(docs_bm),
-                    "final": len(docs_out),
+                # high-level summary
+                print("[VectorRetrieval DEBUG] summary:", {
+                    "k": {"mmr": K_MMR, "bm25": K_BM25, "final": K_FINAL},
+                    "raw_candidates": len(docs_raw),
+                    "final_docs": len(docs_out),
+                    "images_from_meta": sum(1 for m in metas_out if m.get("image_path")),
+                    "request_id": rid,
                 })
+                # and the actual retrieved snippets + metadata
+                print("[VectorRetrieval DEBUG] docs_out:")
+                for i, (doc, meta) in enumerate(zip(docs_out, metas_out), start=1):
+                    print(f"  {i}. {doc[:100]!r}  ← {meta}")
 
             await outputs.default.send(Frame(None,[],None,None,None,other_data))
             self.q.task_done()
@@ -305,7 +347,7 @@ process = CreateElement(
             id="2a7a0b6a-7b84-4c57-8f1c-retrv000003",
             name="vector_retrieval",
             displayName="MM - Vector Retrieval",
-            version="0.53.0",
+            version="0.56.0",
             description="Retrieves via Chroma or PostgresML",
         ),
         frame_receiver_func=retriever.frame_receiver,
