@@ -1,11 +1,10 @@
-import os, sys, time, textwrap, mimetypes, warnings, logging, csv, io, re, json, tempfile
+import os, mimetypes, warnings, logging, re, json, tempfile
 from pathlib import Path
 from typing import List
 
 from webai_element_sdk.element import CreateElement
 from webai_element_sdk.process import Process, ProcessMetadata
 from webai_element_sdk.comms.messages import Frame
-import hashlib
 from PIL import Image
 import torch
 import easyocr
@@ -38,23 +37,15 @@ ALNUM_RE = re.compile(r"[A-Za-z0-9]")
 # Models
 CLIP_MODEL    = "openai/clip-vit-base-patch32"
 BLIP_MODEL    = "Salesforce/blip-image-captioning-base"
-CHARTQA_MODEL = "google/deplot"
+CHARTQA_MODEL = "google/pix2struct-base"
 device = "mps" if torch.backends.mps.is_available() else "cpu"
 
-print("Loading OCR/caption models …")
-clip_model = CLIPModel.from_pretrained(CLIP_MODEL).to(device)
-clip_proc  = CLIPProcessor.from_pretrained(CLIP_MODEL, use_fast=True)
-
-blip_proc  = BlipProcessor.from_pretrained(BLIP_MODEL)
-blip_model = BlipForConditionalGeneration.from_pretrained(BLIP_MODEL).to(device)
-
-p2s_proc   = Pix2StructProcessor.from_pretrained(CHARTQA_MODEL)
-p2s_model  = Pix2StructForConditionalGeneration.from_pretrained(CHARTQA_MODEL).to(device)
+# Lazy handles (filled in at runtime if needed)
+clip_model = clip_proc = blip_model = blip_proc = p2s_model = p2s_proc = None
 
 _easyocr_gpu = torch.cuda.is_available()
 _ocr_langs   = [s.strip() for s in os.getenv("OCR_LANGS", "en").split(",") if s.strip()]
 ocr_model    = easyocr.Reader(_ocr_langs, gpu=_easyocr_gpu, verbose=False)
-print("Models ready\n")
 
 # Helpers
 def blip_caption(path: Path, device=None) -> str:
@@ -67,10 +58,9 @@ def blip_caption(path: Path, device=None) -> str:
     return blip_proc.decode(out[0], skip_special_tokens=True)
 
 def chartqa_caption(path: Path, device=None,
-                    prompt: str = "Generate the underlying data table of the figure below:"):
-    """Return a deplot answer for chart-like images. Requires a text 'prompt'."""
-    img = Image.open(path).convert("RGB")   # ensure 3 channels
-    inputs = p2s_proc(images=img, text=prompt, return_tensors="pt").to(device or ("mps" if torch.backends.mps.is_available() else "cpu"))
+                    prompt: str = "Generate a CSV-like representation of the data in this chart:"):
+    img = Image.open(path).convert("RGB")
+    inputs = p2s_proc(images=img, text=prompt, return_tensors="pt").to(device or device)
     with torch.no_grad():
         out = p2s_model.generate(**inputs, max_new_tokens=128)
     return p2s_proc.decode(out[0], skip_special_tokens=True).strip()
@@ -90,7 +80,6 @@ def ocr_pdf(path: Path):
     return "\n".join(e.text for e in elems if e.text)
 
 def safe_blip_caption(path: Path, enable: bool) -> str:
-    """BLIP caption guarded by a boolean toggle."""
     if not enable:
         return ""
     try:
@@ -436,25 +425,6 @@ def caption_extracted_images(img_docs: list[dict]) -> list[dict]:
     return text_entries
 
 class OCRElement:
-    def _norm(s: str) -> str:
-        return " ".join((s or "").split()).lower()
-
-    def dedupe_text_docs(docs: list[dict], min_chars: int = 12) -> list[dict]:
-        seen, out = set(), []
-        for d in docs:
-            txt = d.get("page_content") or ""
-            if len(txt.strip()) < min_chars:
-                continue
-            meta = d.get("metadata", {})
-            anchor = meta.get("source") or meta.get("image_path") or "na"
-            key = (anchor, meta.get("page"), hash(_norm(txt)))
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(d)
-        return out
-
-class OCRElement:
     async def run(self, process: Process):
         def _norm(s: str) -> str:
             return " ".join((s or "").split()).lower()
@@ -494,6 +464,19 @@ class OCRElement:
         use_chartqa = bool(getattr(settings, "use_chartqa", None) and settings.use_chartqa.value)
         extract_images = bool(getattr(settings, "extract_images", None) and settings.extract_images.value)
 
+        global clip_model, clip_proc, blip_model, blip_proc, p2s_model, p2s_proc
+        if extract_images or use_blip or use_chartqa:
+            print("Loading image models…")
+            clip_model = CLIPModel.from_pretrained(CLIP_MODEL).to(device)
+            clip_proc  = CLIPProcessor.from_pretrained(CLIP_MODEL, use_fast=True)
+
+            blip_proc  = BlipProcessor.from_pretrained(BLIP_MODEL)
+            blip_model = BlipForConditionalGeneration.from_pretrained(BLIP_MODEL).to(device)
+
+            p2s_proc   = Pix2StructProcessor.from_pretrained(CHARTQA_MODEL, torch_dtype=torch.float16)
+            p2s_model  = Pix2StructForConditionalGeneration.from_pretrained(CHARTQA_MODEL, torch_dtype=torch.float16).to(device)
+            print("Image models loaded\n")
+
         # Build text_docs and img_docs
         text_docs, img_docs = load_docs(docs_dir, img_store=img_store, use_blip=use_blip, use_chartqa=use_chartqa, extract_images=extract_images)
 
@@ -527,7 +510,7 @@ process = CreateElement(Process(
         id="2a7a0b6a-7b84-4c57-8f1c-ocr000000001",
         name="ocr",
         displayName="MM - OCR",
-        version="0.44.0",
+        version="0.47.0",
         description="Scans a folder, OCRs PDFs (and images), outputs path to JSON bundle with docs."
     ),
     run_func=ocr.run
