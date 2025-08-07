@@ -43,8 +43,14 @@ class SciEmbedding:
     def __init__(self, model_name: str):
         self.model = SentenceTransformer(model_name, device=device)
         self.dim   = self.model.get_sentence_embedding_dimension()
+
     def __call__(self, texts):
-        return self.model.encode(texts, convert_to_numpy=True).tolist()
+        return self.model.encode(
+            texts,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+            use_multiprocessing=False
+        ).tolist()
 
 def clip_embed_image(path: str, device=None):
     with torch.no_grad():
@@ -233,9 +239,9 @@ process = CreateElement(Process(
     metadata=ProcessMetadata(
         id="2a7a0b6a-7b84-4c57-8f1c-embed000001",
         name="embedding",
-        displayName="MM - Embedding Element",
-        version="0.26.0",
-        description="Receives chunk file path, writes embeddings file (ingest) or emits query embeddings (non-ingest)."
+        displayName="MM - Embedding",
+        version="0.29.0",
+        description="Receives chunk file path, writes embeddings file (ingest) or emits query embeddings (non-ingest)"
     ),
     run_func=embedder.run
 ))

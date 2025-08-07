@@ -238,9 +238,9 @@ process = CreateElement(Process(
     metadata=ProcessMetadata(
         id="2a7a0b6a-7b84-4c57-8f1c-chunk0000001",
         name="chunking",
-        displayName="MM - Chunking Element",
-        version="0.63.0",
-        description="Splits OCR text docs into highly coherent chunks for RAG."
+        displayName="MM - Chunking",
+        version="0.66.0",
+        description="Splits OCR text docs into highly coherent chunks for RAG"
     ),
     run_func=Chunker().run
 ))

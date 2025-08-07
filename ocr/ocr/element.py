@@ -34,6 +34,7 @@ class Settings(ElementSettings):
         description="If true, keep images predicted as chart/diagram/table/screenshot even when no text is found.",
         default=True,
         depends_on=equals("extract_images", True),
+        hints=["advanced"],
     )
     use_blip = BoolSetting(
         name="use_blip",
@@ -41,6 +42,7 @@ class Settings(ElementSettings):
         description="Generate natural-language captions for images (slower).",
         default=False,
         depends_on=equals("extract_images", True),
+        hints=["advanced"],
     )
     use_chartqa = BoolSetting(
         name="use_chartqa",
@@ -48,4 +50,5 @@ class Settings(ElementSettings):
         description="Attempt to read structured data from chart-like images (slower).",
         default=False,
         depends_on=equals("extract_images", True),
+        hints=["advanced"],
     )

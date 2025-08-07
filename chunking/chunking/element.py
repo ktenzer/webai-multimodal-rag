@@ -28,6 +28,7 @@ class Settings(ElementSettings):
         default=800,
         min_value=100,
         step=50,
+        hints=["advanced"],
     )
     chunk_overlap = NumberSetting[int](
         name="chunk_overlap",
@@ -36,6 +37,7 @@ class Settings(ElementSettings):
         default=80,
         min_value=0,
         step=10,
+        hints=["advanced"],
     )
 
     # Semantic parameters
@@ -66,6 +68,7 @@ class Settings(ElementSettings):
         min_value=1,
         step=1,
         depends_on=equals("chunk_strategy", "semantic"),
+        hints=["advanced"],
     )
     semantic_overlap = NumberSetting[int](
         name="semantic_overlap",
@@ -75,6 +78,7 @@ class Settings(ElementSettings):
         min_value=0,
         step=1,
         depends_on=equals("chunk_strategy", "semantic"),
+        hints=["advanced"],
     )
     llm_token_model = TextSetting(
         name="llm_token_model",
