@@ -504,7 +504,8 @@ class Retriever:
                 "You are given the following sources. Answer the question using ONLY these sources.",
                 "Do **not** put inline citations like (Source 1).",
                 "At the very end of your answer, include a “Citation(s):” section listing each source and page.",
-                "If related figures are listed, include them as bullet lines like: - [filename](file:///…).",
+                "If a “Related figure(s):” section appears below, copy those bullet lines EXACTLY as-is into your answer. Do not add, edit, or invent links.",
+                "If there is no “Related figure(s):” section, do NOT include any file:// links (no PDF/page links either).",
                 "",
                 f"Question: {q_text}",
                 "",
@@ -541,11 +542,23 @@ class Retriever:
 
             api_in  = other.get("api") or []
             api_out = [msg for msg in api_in if isinstance(msg, dict) and msg.get("role") == "system"]
+
+            # Always-on guardrail
+            api_out.append({
+                "role": "system",
+                "content": (
+                    "Never invent file:// links. Only include figure links if a 'Related figure(s)' list is present "
+                    "in the user content. If no list is present, include no file:// links or PDF/page links."
+            )
+            })
+
             if images_attached:
                 api_out.append({
-                    "role": "system",
-                    "content": "If related figures are provided, include them as bullet lines like: - [filename](file:///…)."
+                        "role": "system",
+                        "content": "If a 'Related figure(s)' list is present, copy the bullet lines exactly as provided. "
+                                "Do not add placeholders or new links."
                 })
+
             api_out.append({"role": "user", "content": context})
 
             other_data = {
@@ -558,6 +571,7 @@ class Retriever:
                 "request_id": rid,
                 "images": images_attached,
             }
+
 
             if debug:
                 print("[VectorRetrieval DEBUG] summary:", {
@@ -582,7 +596,7 @@ process = CreateElement(
             id="2a7a0b6a-7b84-4c57-8f1c-retrv000003",
             name="vector_retrieval",
             displayName="MM - Vector Retrieval",
-            version="0.67.0",
+            version="0.69.0",
             description="Retrieves from <base>_text and <base>_images; merges page snippets; surfaces figures as Markdown links to file://."
         ),
         frame_receiver_func=retriever.frame_receiver,
