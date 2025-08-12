@@ -25,9 +25,9 @@ Under OCR settings you need to select a data directory and images directory. The
 Under Vector Store settings set the vectordb directory.
 
 Example:
-Data directory: /my/data
-Images directory: /my/data/images
-VectorDB directory: /my/data
+- Data directory: /my/data
+- Images directory: /my/data/images
+- VectorDB directory: /my/data
 
 ![Ingest Setup 2](images/MM_RAG_setup_2.png)
 
@@ -38,7 +38,7 @@ After ingest completes you should see the vectordb and image clippings. Since te
 ## Inference Configuration
 Connect API, LLM, MM Embedding and MM Vector Retrieval elements.
 
-![Ingest Inference 1](images/MM_RAG_Inference.png)
+![Ingest Inference 1](images/MM_RAG_Inference_1.png)
 
 Under MM Embedding ensure the "Is Ingestion" toggle is set to False. In the MM Vector Retrieval select location of vectordb, same directory you created it in during ingest phase.
 
