@@ -18,7 +18,7 @@ class Settings(ElementSettings):
         name="extract_images",
         display_name="Extract images from PDFs & stand-alone files",
         description="When off, OCR will only index text and tables — no images will be saved.",
-        default=False,
+        default=True,
     )    
     image_store_folder = TextSetting(
         name="image_store_folder",
@@ -40,7 +40,7 @@ class Settings(ElementSettings):
         name="use_blip",
         display_name="Use BLIP captioner",
         description="Generate natural-language captions for images (slower).",
-        default=False,
+        default=True,
         depends_on=equals("extract_images", True),
         hints=["advanced"],
     )
@@ -48,7 +48,7 @@ class Settings(ElementSettings):
         name="use_chartqa",
         display_name="Use Chart/Table interpreter (ChartQA)",
         description="Attempt to read structured data from chart-like images (slower).",
-        default=False,
+        default=True,
         depends_on=equals("extract_images", True),
         hints=["advanced"],
     )

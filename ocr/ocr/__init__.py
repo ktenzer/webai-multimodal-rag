@@ -1,3 +1,4 @@
+# ocr/__init__.py
 import os, mimetypes, warnings, logging, re, json, tempfile
 from pathlib import Path
 from typing import List
@@ -40,7 +41,7 @@ BLIP_MODEL    = "Salesforce/blip-image-captioning-base"
 CHARTQA_MODEL = "google/pix2struct-base"
 device = "mps" if torch.backends.mps.is_available() else "cpu"
 
-# Lazy handles (filled in at runtime if needed)
+# Lazy handles
 clip_model = clip_proc = blip_model = blip_proc = p2s_model = p2s_proc = None
 
 _easyocr_gpu = torch.cuda.is_available()
@@ -158,10 +159,9 @@ def classify_visual_type(image_path: str) -> str:
             clip_model.to(device)
             image_emb = clip_model.get_image_features(pixel_values=inputs["pixel_values"].to(device))
             text_emb  = clip_model.get_text_features(input_ids=inputs["input_ids"].to(device), attention_mask=inputs["attention_mask"].to(device))
-            # cosine similarity
             image_emb = torch.nn.functional.normalize(image_emb, dim=-1)
             text_emb  = torch.nn.functional.normalize(text_emb,  dim=-1)
-            sims = (image_emb @ text_emb.T).squeeze(0)  # (num_labels,)
+            sims = (image_emb @ text_emb.T).squeeze(0)
             idx = int(torch.argmax(sims).cpu().item())
         return VISION_LABELS[idx]
     except Exception as e:
@@ -170,6 +170,7 @@ def classify_visual_type(image_path: str) -> str:
 def has_text(s: str, min_chars: int) -> bool:
     return bool(ALNUM_RE.search(s)) and (len(s.strip()) >= min_chars)
 
+# Loaders
 def load_docs(docs_dir: Path, img_store: Path | None, use_blip: bool, use_chartqa: bool, extract_images: bool):
     text_docs, img_docs = [], []
 
@@ -181,12 +182,9 @@ def load_docs(docs_dir: Path, img_store: Path | None, use_blip: bool, use_chartq
         # Standalone images
         if mime.startswith("image"):
             img_docs.append({"page_content": "", "metadata": {"image_path": str(fp)}})
-
-            # create the text doc for this image (caption + OCR + chart)
             cap   = safe_blip_caption(fp, enable=use_blip)
             chart = safe_chart_caption(fp, enable=use_chartqa)
             ocr   = safe_doctr_ocr(fp)
-
             combo = " • ".join(t for t in (cap, chart, ocr) if t)
             if combo:
                 text_docs.append({
@@ -196,10 +194,11 @@ def load_docs(docs_dir: Path, img_store: Path | None, use_blip: bool, use_chartq
                         "caption": bool(cap),
                         "chartqa": bool(chart),
                         "ocr": bool(ocr),
+                        "source_type": "image_text"
                     }
                 })
 
-        # PDFs (extract text + tables + images)
+        # PDFs
         elif fp.suffix.lower() == ".pdf":
             try:
                 with pdfplumber.open(str(fp)) as pdf:
@@ -209,46 +208,47 @@ def load_docs(docs_dir: Path, img_store: Path | None, use_blip: bool, use_chartq
                             for sub in chunk_text(txt, max_words=500, overlap=100):
                                 text_docs.append({
                                 "page_content": sub,
-                                "metadata": {"source": str(fp), "page": page_num}
+                                "metadata": {"source": str(fp), "page": page_num, "source_type": "text"}
                                 })
             except Exception:
-                # fallback to single-chunk if pdfplumber fails
                 text = ocr_pdf(fp)
                 text_docs.append({
                     "page_content": text,
-                    "metadata": {"source": str(fp), "page": None}
+                    "metadata": {"source": str(fp), "page": None, "source_type": "text"}
                 })
 
             # Tables
-            text_docs.extend(tables_docs(fp))
+            for d in tables_docs(fp):
+                d.setdefault("metadata", {}).setdefault("source_type", "text")
+                text_docs.append(d)
 
-            # Embedded images
-            if img_store is not None:
-                if extract_images and img_store is not None:
-                    extracted = extract_pdf_images(fp, img_store)
-                    img_docs.extend(extracted)
+            # Embedded images — now keep even if no OCR text (based on size/visual class)
+            if img_store is not None and extract_images:
+                extracted = extract_pdf_images(fp, img_store)
+                img_docs.extend(extracted)
 
-                    for img_doc in extracted:
-                        img_fp = Path(img_doc["metadata"]["image_path"])
-                        cap   = safe_blip_caption(img_fp, enable=use_blip)
-                        chart = safe_chart_caption(img_fp, enable=use_chartqa)
-                        ocr   = safe_doctr_ocr(img_fp)
+                for img_doc in extracted:
+                    img_fp = Path(img_doc["metadata"]["image_path"])
+                    cap   = safe_blip_caption(img_fp, enable=use_blip)
+                    chart = safe_chart_caption(img_fp, enable=use_chartqa)
+                    ocr   = safe_doctr_ocr(img_fp)
 
-                        combo = " • ".join(t for t in (cap, chart, ocr) if t)
-                        if combo:
-                            meta = {**img_doc["metadata"], "caption": bool(cap),
-                                    "chartqa": bool(chart), "ocr": bool(ocr)}
-                            text_docs.append({
-                                "page_content": combo,
-                                "metadata": meta
-                            })
+                    combo = " • ".join(t for t in (cap, chart, ocr) if t)
+                    if combo:
+                        meta = {**img_doc["metadata"], "caption": bool(cap),
+                                "chartqa": bool(chart), "ocr": bool(ocr),
+                                "source_type": "image_text"}
+                        text_docs.append({
+                            "page_content": combo,
+                            "metadata": meta
+                        })
 
                 print(f"[OCR] image_store_folder -> {img_store}")
 
-        # Plain text files
+        # Plain text
         elif fp.suffix.lower() in {".txt", ".md"}:
             print(f"Load {fp.name}")
-            text_docs.append({"page_content": fp.read_text(), "metadata": {"source": str(fp)}})
+            text_docs.append({"page_content": fp.read_text(), "metadata": {"source": str(fp), "source_type": "text"}})
 
     print(f"Loaded {len(text_docs)} text docs & {len(img_docs)} images\n")
     return text_docs, img_docs
@@ -259,9 +259,10 @@ def extract_pdf_images(pdf_path: Path, out_dir: Path) -> list[dict]:
         print(f"[OCR] PyMuPDF not available; skipping embedded images for {pdf_path.name}")
         return out
 
-    # strict keep policy
     MIN_OCR_CHARS = 6
     CONF_THRESHOLD = 0.30
+    MIN_DIM = 48
+    MIN_AREA = 16000  # ~126x126
 
     def _has_alnum_and_len(s: str) -> bool:
         s = (s or "").strip()
@@ -276,43 +277,27 @@ def extract_pdf_images(pdf_path: Path, out_dir: Path) -> list[dict]:
         raise RuntimeError("numpy is required for OCR filtering of embedded images")
 
     doc = fitz.open(pdf_path)
-    kept = skipped = 0
     try:
         for pno in range(len(doc)):
             page = doc[pno]
-            images = page.get_images(full=True)
-            if not images:
-                continue
-
+            images = page.get_images(full=True) or []
             for img_idx, img in enumerate(images):
                 xref = img[0]
-
-                # Prefer rendering the exact image rect(s) from the page (always RGB).
-                rects = page.get_image_rects(xref)
-                if not rects:
-                    rects = []
-
-                # we may have multiple rects reusing the same xref; iterate them
-                used_any_rect = False
+                rects = page.get_image_rects(xref) or [page.rect] 
                 for r_idx, rect in enumerate(rects):
                     try:
-                        mat = fitz.Matrix(2, 2)  # 2x scale for better OCR; adjust if needed
+                        mat = fitz.Matrix(2, 2)
                         pm = page.get_pixmap(clip=rect, matrix=mat, alpha=False, colorspace=fitz.csRGB)
                         png_bytes = pm.tobytes("png")
                         pil_img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
                     except Exception as e:
-                        # If rect render somehow fails, try next rect or fall back later
                         print(f"[OCR] rect render failed (xref={xref}, page={pno+1}): {e}")
                         continue
 
-                    used_any_rect = True
+                    w, h = pil_img.size
+                    area_ok = (min(w, h) >= MIN_DIM) and (w * h >= MIN_AREA)
 
-                    # Skip tiny assets / icons quickly
-                    if min(pil_img.size) < 16 or (pil_img.size[0] * pil_img.size[1]) < 400:
-                        skipped += 1
-                        continue
-
-                    # OCR to decide keep/skip
+                    # OCR text
                     try:
                         ocr_results = ocr_model.readtext(_np.array(pil_img))
                         parts = [t for (_bbox, t, conf) in ocr_results
@@ -321,84 +306,42 @@ def extract_pdf_images(pdf_path: Path, out_dir: Path) -> list[dict]:
                     except Exception:
                         ocr_text = ""
 
-                    if not _has_alnum_and_len(ocr_text):
-                        skipped += 1
-                        continue  # DO NOT SAVE
+                    keep = _has_alnum_and_len(ocr_text)
+                    vision_label = None
 
-                    # Save passing images (RGB PNG via PIL)
+                    # If no OCR text, keep if it's big or looks like a chart/diagram/table
+                    if not keep and area_ok:
+                        try:
+                            vision_label = classify_visual_type(_save_temp(pil_img))
+                        except Exception:
+                            vision_label = None
+                        if vision_label in {"chart","diagram","table"}:
+                            keep = True
+
+                    if not keep:
+                        continue
+
                     name = hashlib.sha1(f"{pdf_path.name}:{pno}:{xref}:{r_idx}".encode()).hexdigest() + ".png"
                     fp = out_dir / name
                     pil_img.save(fp, format="PNG", optimize=True)
-                    kept += 1
-                    print(f"[OCR] saved embedded image (has text) -> {fp}")
 
-                    out.append({
-                        "page_content": "",
-                        "metadata": {
-                            "image_path": str(fp),
-                            "source": str(pdf_path),
-                            "page": pno + 1,
-                        },
-                    })
+                    meta = {"image_path": str(fp), "source": str(pdf_path), "page": pno + 1}
+                    if vision_label:
+                        meta["vision_label"] = vision_label
 
-                if used_any_rect:
-                    continue
-
-                # Fallback: no rects (rare). Render entire page.
-                try:
-                    # Try raw export to PIL as a last resort 
-                    pix = fitz.Pixmap(doc, xref)
-                    try:
-                        png_bytes = pix.tobytes("png")  # may raise unsupported colorspace
-                        pil_img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
-                    except Exception:
-                        # Rasterize the whole page and hope the image occupies most of it
-                        mat = fitz.Matrix(2, 2)
-                        pm = page.get_pixmap(matrix=mat, alpha=False, colorspace=fitz.csRGB)
-                        png_bytes = pm.tobytes("png")
-                        pil_img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
-                except Exception as e:
-                    print(f"[OCR] fallback render failed (xref={xref}, page={pno+1}): {e}")
-                    continue
-
-                # Skip tiny assets
-                if min(pil_img.size) < 16 or (pil_img.size[0] * pil_img.size[1]) < 400:
-                    skipped += 1
-                    continue
-
-                # OCR
-                try:
-                    ocr_results = ocr_model.readtext(_np.array(pil_img))
-                    parts = [t for (_bbox, t, conf) in ocr_results
-                             if (conf is None) or (conf >= CONF_THRESHOLD)]
-                    ocr_text = " ".join(parts)
-                except Exception:
-                    ocr_text = ""
-
-                if not _has_alnum_and_len(ocr_text):
-                    skipped += 1
-                    continue
-
-                name = hashlib.sha1(f"{pdf_path.name}:{pno}:{xref}:fb".encode()).hexdigest() + ".png"
-                fp = out_dir / name
-                pil_img.save(fp, format="PNG", optimize=True)
-                kept += 1
-                print(f"[OCR] saved embedded image (fallback, has text) -> {fp}")
-
-                out.append({
-                    "page_content": "",
-                    "metadata": {
-                        "image_path": str(fp),
-                        "source": str(pdf_path),
-                        "page": pno + 1,
-                    },
-                })
-
+                    out.append({"page_content": "", "metadata": meta})
     finally:
         doc.close()
 
-    print(f"[OCR] {pdf_path.name}: kept {kept} / skipped {skipped} (saved to {out_dir})")
+    print(f"[OCR] {pdf_path.name}: saved {len(out)} images to {out_dir}")
     return out
+
+# Classify without persisting temp to disk long-term
+def _save_temp(pil_img: Image.Image) -> str:
+    import tempfile
+    p = Path(tempfile.mkstemp(suffix=".png")[1])
+    pil_img.save(p, format="PNG")
+    return str(p)
 
 def caption_extracted_images(img_docs: list[dict]) -> list[dict]:
     text_entries: list[dict] = []
@@ -413,11 +356,11 @@ def caption_extracted_images(img_docs: list[dict]) -> list[dict]:
                 "page_content": combo,
                 "metadata": {
                     "image_path": str(ip),
-                    "caption": True,
+                    "caption": bool(cap),
                     "chartqa": bool(chart),
                     "ocr": bool(ocr),
-                    # also preserve originating PDF context if present:
-                    **({k: v for k, v in d.get("metadata", {}).items() if k in ("source", "page")})
+                    "source_type": "image_text",
+                    **({k: v for k, v in d.get("metadata", {}).items() if k in ("source", "page","vision_label")})
                 }
             })
         except Exception as e:
@@ -446,20 +389,17 @@ class OCRElement:
         
         settings, outputs = process.settings, process.outputs
 
-        # Input documents directory
         data_path = settings.dataset_folder_path.value
         if not data_path or not Path(data_path).exists():
             raise Exception(f"Invalid dataset_folder_path: {data_path}")
         docs_dir = Path(data_path).resolve()
 
-        # Where to store extracted/normalized images
         img_store_val = getattr(settings, "image_store_folder", None)
         if not img_store_val or not img_store_val.value:
             raise Exception("image_store_folder must be set in element settings.")
         img_store = Path(img_store_val.value).expanduser().resolve()
         img_store.mkdir(parents=True, exist_ok=True)
 
-        # Read toggles from element settings
         use_blip    = bool(getattr(settings, "use_blip", None) and settings.use_blip.value)
         use_chartqa = bool(getattr(settings, "use_chartqa", None) and settings.use_chartqa.value)
         extract_images = bool(getattr(settings, "extract_images", None) and settings.extract_images.value)
@@ -469,38 +409,50 @@ class OCRElement:
             print("Loading image models…")
             clip_model = CLIPModel.from_pretrained(CLIP_MODEL).to(device)
             clip_proc  = CLIPProcessor.from_pretrained(CLIP_MODEL, use_fast=True)
-
             blip_proc  = BlipProcessor.from_pretrained(BLIP_MODEL)
             blip_model = BlipForConditionalGeneration.from_pretrained(BLIP_MODEL).to(device)
-
             p2s_proc   = Pix2StructProcessor.from_pretrained(CHARTQA_MODEL, torch_dtype=torch.float16)
             p2s_model  = Pix2StructForConditionalGeneration.from_pretrained(CHARTQA_MODEL, torch_dtype=torch.float16).to(device)
             print("Image models loaded\n")
 
-        # Build text_docs and img_docs
-        text_docs, img_docs = load_docs(docs_dir, img_store=img_store, use_blip=use_blip, use_chartqa=use_chartqa, extract_images=extract_images)
+        text_docs_all, img_docs = load_docs(docs_dir, img_store=img_store, use_blip=use_blip, use_chartqa=use_chartqa, extract_images=extract_images)
 
-        # Optional: dedupe text
-        text_docs = dedupe_text_docs(text_docs)
+        # Split into pure text vs image-derived text
+        text_docs = []
+        image_text_docs = []
+        for d in text_docs_all:
+            if d.get("metadata", {}).get("source_type") == "image_text" or "image_path" in d.get("metadata", {}):
+                image_text_docs.append(d)
+            else:
+                text_docs.append(d)
 
-        # Write tmp json bundle, don't pass images downstream
+        # Dedupe
+        text_docs       = dedupe_text_docs(text_docs)
+        image_text_docs = dedupe_text_docs(image_text_docs)
+
+        # Bundle (images are stored on disk, not passed downstream as binaries)
         fd, tmp_path = tempfile.mkstemp(prefix="ocr_bundle_", suffix=".json", dir="/tmp")
         os.close(fd)
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(
-                {"text_docs": text_docs, "img_docs": [], "source_dir": str(docs_dir)},
+                {
+                    "text_docs": text_docs,
+                    "image_text_docs": image_text_docs,
+                    "img_docs": img_docs,
+                    "source_dir": str(docs_dir)
+                },
                 f,
                 ensure_ascii=False
             )
-        print(f"OCR wrote bundle: {tmp_path} (images omitted; text-only indexing)")
+        print(f"OCR wrote bundle: {tmp_path} (text + image-derived text)")
 
-        # Emit path via Frame.other_data
         await outputs.default.send(
             Frame(
                 None, [], None, None, None,
                 {"file_path": tmp_path}
             )
         )
+
 ocr = OCRElement()
 
 process = CreateElement(Process(
@@ -510,8 +462,10 @@ process = CreateElement(Process(
         id="2a7a0b6a-7b84-4c57-8f1c-ocr000000001",
         name="ocr",
         displayName="MM - OCR",
-        version="0.47.0",
-        description="Scans a folder, OCRs PDFs (and images), outputs path to JSON bundle with docs."
+        version="0.50.0",
+        description="Scans a folder, OCRs PDFs (and images), outputs path to JSON bundle with docs split by modality."
     ),
     run_func=ocr.run
 ))
+
+

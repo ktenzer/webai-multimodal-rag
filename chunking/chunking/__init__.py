@@ -125,7 +125,7 @@ def semantic_split(
         while i < len(sents):
             j = min(i + window, len(sents))
             chunk_emb = embs[i:j].mean(dim=0, keepdim=True)
-            # Check if on average it’s still coherent
+
             avg_sim = float(cos_sim(chunk_emb, embs[i:j]).mean())
             text = " ".join(sents[i:j]).strip()
 
@@ -136,7 +136,7 @@ def semantic_split(
             if text:
                 md = doc.metadata.copy()
                 md.setdefault("split_method", "semantic_simple")
-                md["avg_sim"] = round(avg_sim, 2)
+                md["avg_sim"] = round(avg_sim, 2)  # <— restored
                 out.append(Document(page_content=text, metadata=md))
 
             # Advance chunk
@@ -173,48 +173,64 @@ class Chunker:
 
             # Load OCR bundle
             bundle = json.loads(Path(path).read_text(encoding="utf-8"))
-            docs = [
+
+            # Build pure text and image-derived text
+            docs_text = [
                 Document(page_content=d["page_content"], metadata=d["metadata"])
                 for d in bundle.get("text_docs", [])
+            ]
+            docs_image_text = [
+                Document(page_content=d["page_content"], metadata=d["metadata"])
+                for d in bundle.get("image_text_docs", [])  
             ]
 
             # Fetch common settings
             strategy      = settings.chunk_strategy.value
             token_model   = settings.llm_token_model.value  
             max_tokens    = int(settings.max_chunk_tokens.value)
-            out_chunks = []
 
-            if strategy == "semantic":
-                out_chunks = semantic_split(
-                    docs,
-                    settings.semantic_model.value,
-                    settings.semantic_window_size.value,
-                    settings.semantic_overlap.value,
-                    token_model,
-                    max_tokens
-                )
-            elif strategy == "recursive":
-                out_chunks = recursive_split_with_headings(
-                    docs,
-                    settings.chunk_size.value,
-                    settings.chunk_overlap.value,
-                    token_model,
-                    max_tokens
-                )
-            else:
-                out_chunks = md_split(
-                    docs,
-                    settings.chunk_size.value,
-                    settings.chunk_overlap.value,
-                )
+            def _split(docs: List[Document]) -> List[Document]:
+                if strategy == "semantic":
+                    return semantic_split(
+                        docs,
+                        settings.semantic_model.value,
+                        settings.semantic_window_size.value,
+                        settings.semantic_overlap.value,
+                        token_model,
+                        max_tokens
+                    )
+                elif strategy == "recursive":
+                    return recursive_split_with_headings(
+                        docs,
+                        settings.chunk_size.value,
+                        settings.chunk_overlap.value,
+                        token_model,
+                        max_tokens
+                    )
+                else:
+                    return md_split(
+                        docs,
+                        settings.chunk_size.value,
+                        settings.chunk_overlap.value,
+                    )
+
+            # Run chosen splitter on both corpora
+            out_chunks_text = _split(docs_text)
+            out_chunks_imgt = _split(docs_image_text)
 
             # Serialize
             chunks_dicts = [
                 {"page_content": c.page_content, "metadata": c.metadata}
-                for c in out_chunks
+                for c in out_chunks_text
             ]
+            img_chunks_dicts = [
+                {"page_content": c.page_content, "metadata": c.metadata}
+                for c in out_chunks_imgt
+            ]
+
             out_payload = {
                 "txt_chunks": chunks_dicts,
+                "img_txt_chunks": img_chunks_dicts, 
                 "img_docs":   bundle.get("img_docs", []),
                 "prev_tmp_files": [path]
             }
@@ -224,7 +240,7 @@ class Chunker:
             with open(out_path, "w", encoding="utf-8") as wf:
                 json.dump(out_payload, wf, ensure_ascii=False)
 
-            print(f"Chunking wrote: {out_path}")
+            print(f"Chunking wrote: {out_path} (text={len(chunks_dicts)}, image_text={len(img_chunks_dicts)})")
             await outputs.default.send(Frame(None, [], None, None, None, {"file_path": out_path}))
             processed.add(path)
             processed_any = True
@@ -239,8 +255,8 @@ process = CreateElement(Process(
         id="2a7a0b6a-7b84-4c57-8f1c-chunk0000001",
         name="chunking",
         displayName="MM - Chunking",
-        version="0.67.0",
-        description="Splits OCR text docs into highly coherent chunks for RAG"
+        version="0.69.0", 
+        description="Splits OCR text docs into highly coherent chunks for RAG (and image-derived text separately)."
     ),
     run_func=Chunker().run
 ))

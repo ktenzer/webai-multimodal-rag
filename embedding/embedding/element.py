@@ -1,4 +1,4 @@
-from webai_element_sdk.element.settings import ElementSettings, BoolSetting, TextSetting, equals
+from webai_element_sdk.element.settings import ElementSettings, BoolSetting, TextSetting
 from webai_element_sdk.element.variables import ElementInputs, ElementOutputs, Input, Output
 from webai_element_sdk.comms.messages import Frame 
 
@@ -49,7 +49,4 @@ class Settings(ElementSettings):
         ],
         hints=["dropdown"],
         required=False,
-
-        # Only show CLIP picker when in ingestion mode
-        depends_on=equals("is_ingestion", True),
     )    
