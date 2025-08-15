@@ -572,7 +572,6 @@ class Retriever:
                 "images": images_attached,
             }
 
-
             if debug:
                 print("[VectorRetrieval DEBUG] summary:", {
                     "k": {"mmr": settings.top_k_mmr.value, "bm25": settings.top_k_bm25.value, "final": settings.top_k.value},
@@ -581,6 +580,16 @@ class Retriever:
                     "attached_images": len(images_attached),
                     "request_id": rid,
                 })
+                print("[VectorRetrieval DEBUG] top_k → LLM (merged by page):")
+                for i, (d, m) in enumerate(zip(docs_merged, metas_merged), start=1):
+                    src = m.get("source") or m.get("image_path", "")
+                    page = m.get("page")
+                    fname = Path(src).name if src else "unknown"
+                    print(f"  {i}. {fname}{f', page {page}' if page is not None else ''}: {_shorten(d, 200)}")
+                if images_attached:
+                    print("[VectorRetrieval DEBUG] image links → LLM:")
+                    for i, im in enumerate(images_attached, start=1):
+                        print(f"  Link{i}: {im.get('file_url','')} ({im.get('filename','')})")
 
             await outputs.default.send(Frame(None,[],None,None,None,other_data))
             self.q.task_done()
@@ -596,7 +605,7 @@ process = CreateElement(
             id="2a7a0b6a-7b84-4c57-8f1c-retrv000003",
             name="vector_retrieval",
             displayName="MM - Vector Retrieval",
-            version="0.71.0",
+            version="0.72.0",
             description="Retrieves from <base>_text and <base>_images; merges page snippets; surfaces figures as Markdown links to file://."
         ),
         frame_receiver_func=retriever.frame_receiver,
