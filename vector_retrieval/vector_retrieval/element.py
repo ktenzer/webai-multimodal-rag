@@ -24,7 +24,6 @@ class Settings(ElementSettings):
         display_name="Vector DB Path",
         description="Folder where the Chroma vector database is stored (used if the input frame does not provide a path).",
         default="",
-        required=False,
         hints=["folder_path"],
         depends_on=equals("vector_store_type", "chromadb"),
     )
@@ -35,7 +34,6 @@ class Settings(ElementSettings):
         display_name="Postgres Table Name",
         description="Table (with pgvector column) to query.",
         default="webai",
-        required=True,
         depends_on=equals("vector_store_type", "postgresml"),
     )
     pgml_host = TextSetting(
@@ -68,7 +66,6 @@ class Settings(ElementSettings):
         default="",
         depends_on=equals("vector_store_type", "postgresml"),
         sensitive=True,
-        required=False,
     )    
     top_k = NumberSetting[int](
         name="top_k",

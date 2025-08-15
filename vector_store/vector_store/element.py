@@ -23,7 +23,7 @@ class Settings(ElementSettings):
         display_name="Chroma DB Path",
         description="Folder where the Chroma vector database will be stored.",
         default="",
-        required=False,
+        required=True,
         hints=["folder_path"],
         depends_on=equals("vector_store_type", "chromadb"),
     )

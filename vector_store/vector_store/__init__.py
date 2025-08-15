@@ -235,7 +235,7 @@ process = CreateElement(
             id="2a7a0b6a-7b84-4c57-8f1c-store000003",
             name="vector_store",
             displayName="MM - Vector Store",
-            version="0.29.0",
+            version="0.30.0",
             description="Writes to Chroma/PostgresML using <base>_text and <base>_images (image text + stubs)."
         ),
         run_func=writer.run,

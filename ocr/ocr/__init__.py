@@ -1,5 +1,6 @@
 # ocr/__init__.py
 import os, mimetypes, warnings, logging, re, json, tempfile
+import asyncio
 from pathlib import Path
 from typing import List
 
@@ -453,6 +454,11 @@ class OCRElement:
             )
         )
 
+        # Hack: Keep element running as if one element completes all will be killed by platform
+        while True:
+            await asyncio.sleep(1)
+
+
 ocr = OCRElement()
 
 process = CreateElement(Process(
@@ -462,7 +468,7 @@ process = CreateElement(Process(
         id="2a7a0b6a-7b84-4c57-8f1c-ocr000000001",
         name="ocr",
         displayName="MM - OCR",
-        version="0.50.0",
+        version="0.53.0",
         description="Scans a folder, OCRs PDFs (and images), outputs path to JSON bundle with docs split by modality."
     ),
     run_func=ocr.run

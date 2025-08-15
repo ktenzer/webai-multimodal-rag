@@ -15,6 +15,10 @@ nltk.download("stopwords", quiet=True)
 from transformers import AutoTokenizer
 from sentence_transformers import SentenceTransformer
 from sentence_transformers.util import cos_sim
+from transformers import logging as hf_logging
+
+from typing import Iterable
+from transformers import PreTrainedTokenizerBase
 
 from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 from langchain_community.docstore.document import Document
@@ -25,6 +29,7 @@ from webai_element_sdk.comms.messages import Frame
 
 from .element import Inputs, Outputs, Settings
 
+TOKENIZERS_PARALLELISM=False
 IDLE_TIMEOUT = 3.0  # seconds
 
 # Protect table data merging contiguous lines
@@ -69,6 +74,51 @@ def md_split(
     print(f"{len(out)} chunks ({time.time()-t0:.1f}s)\n")
     return out
 
+def enforce_max_for_embedder(embedder, hard_max: int):
+    # Align Sentence-Transformers and HF tokenizer limits
+    if hasattr(embedder, "max_seq_length"):
+        embedder.max_seq_length = hard_max
+    if hasattr(embedder, "tokenizer"):
+        try:
+            embedder.tokenizer.model_max_length = hard_max  # avoids HF warnings
+        except Exception:
+            pass
+
+def split_text_by_token_ids(text: str, tok, safe_max: int) -> list[str]:
+    ids = tok.encode(text, add_special_tokens=False)
+    if not ids:
+        return []
+    pieces = []
+    for i in range(0, len(ids), safe_max):
+        sub = ids[i:i+safe_max]
+        pieces.append(tok.decode(sub, skip_special_tokens=True))
+    return pieces
+
+def token_id_chunks(text: str, tok, max_len: int) -> List[str]:
+    ids = tok.encode(text, add_special_tokens=False)
+    if not ids:
+        return []
+    out = []
+    for i in range(0, len(ids), max_len):
+        sub = ids[i:i+max_len]
+        out.append(tok.decode(sub, skip_special_tokens=True))
+    return out
+
+def get_embedder_tokenizer_and_limit(model_name: str, fallback: int = 512):
+    tok = AutoTokenizer.from_pretrained(model_name)
+    # Some tokenizers use a giant sentinel like 1e30 for "no limit"
+    raw = getattr(tok, "model_max_length", None)
+    if raw is None or raw > 10**8:  
+        raw = fallback
+    # leave headroom for specials
+    safe_max = max(8, int(raw) - 2)
+    # clamp tokenizer
+    try:
+        tok.model_max_length = int(raw)
+    except Exception:
+        pass
+    return tok, safe_max
+
 
 # Recursive Split via heading
 def recursive_split_with_headings(
@@ -76,14 +126,18 @@ def recursive_split_with_headings(
     chunk_size: int,
     overlap: int,
     token_model: str,
-    max_tokens: int
+    max_tokens: int,
+    embedder_model: str,
 ) -> List[Document]:
-    header = MarkdownHeaderTextSplitter(
-        headers_to_split_on=[("#","h1"),("##","h2"),("###","h3")]
-    )
-    rc = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=overlap)
+    header = MarkdownHeaderTextSplitter(headers_to_split_on=[("#","h1"),("##","h2"),("###","h3")])
+    rc     = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=overlap)
+
+    # One embedder tokenizer reused for all chunks, clamped to 512
+    embed_tok, safe_max = get_embedder_tokenizer_and_limit(embedder_model)
+
     out: List[Document] = []
     t0 = time.time()
+
     for doc in docs:
         text = protect_tables(doc.page_content)
         for sec in header.split_text(text):
@@ -94,10 +148,23 @@ def recursive_split_with_headings(
             )))
             for ch in rc.split_text(sec.page_content):
                 chunk = (path + "\n\n" + ch).strip()
-                # enforce token budget
-                while token_count(chunk, token_model) > max_tokens:
+
+                # LLM-side cap first
+                while token_count(chunk, token_model) > max_tokens and " " in chunk:
                     chunk = chunk.rsplit(" ", 1)[0]
-                out.append(Document(page_content=chunk, metadata=doc.metadata))
+                while token_count(chunk, token_model) > max_tokens and len(chunk) > 0:
+                    chunk = chunk[:-50]  # fallback for no-space runs
+
+                if not chunk:
+                    continue
+
+                # Embedder-side cap 
+                parts = token_id_chunks(chunk, embed_tok, safe_max)
+                if not parts:
+                    continue
+                for p in parts:
+                    out.append(Document(page_content=p, metadata=doc.metadata))
+
     print(f"[Chunk] recursive_split → {len(out)} chunks in {time.time()-t0:.1f}s")
     return out
 
@@ -107,40 +174,53 @@ def semantic_split(
     model_name: str,
     window: int,
     overlap: int,
-    token_model: str,
+    token_model: str, 
     max_tokens: int,
 ) -> list[Document]:
+    # Embedder + tokenizer, both clamped to 512
     embedder = SentenceTransformer(model_name)
-    out = []
+    try:
+        embedder.max_seq_length = 512
+    except Exception:
+        pass
+    embed_tok, safe_max = get_embedder_tokenizer_and_limit(model_name)
+
+    out: list[Document] = []
 
     for doc in docs:
-        sents = sent_tokenize(doc.page_content)
-        if not sents:
+        # Merge table lines first, then sentence-split
+        base = protect_tables(doc.page_content)
+        sents = sent_tokenize(base) or [base]
+
+        # Token-ID split: guarantee each piece under embedder cap
+        safe_sents: list[str] = []
+        for s in sents:
+            safe_sents.extend(token_id_chunks(s, embed_tok, safe_max))
+        if not safe_sents:
             continue
 
-        # Precompute embeddings
-        embs = embedder.encode(sents, convert_to_tensor=True)
+        embs = embedder.encode(safe_sents, convert_to_tensor=True, show_progress_bar=False)
 
-        i = 0
-        while i < len(sents):
-            j = min(i + window, len(sents))
-            chunk_emb = embs[i:j].mean(dim=0, keepdim=True)
+        i, step = 0, max(1, window - overlap)
+        while i < len(safe_sents):
+            j = min(i + window, len(safe_sents))
+            text = " ".join(safe_sents[i:j]).strip()
 
-            avg_sim = float(cos_sim(chunk_emb, embs[i:j]).mean())
-            text = " ".join(sents[i:j]).strip()
-
-            # Enforce token budget
+            # LLM-side budget (may be a different tokenizer)
             while token_count(text, token_model) > max_tokens and " " in text:
                 text = text.rsplit(" ", 1)[0]
+            while token_count(text, token_model) > max_tokens and len(text) > 0:
+                text = text[:-50]
 
             if text:
+                chunk_emb = embs[i:j].mean(dim=0, keepdim=True)
+                avg_sim = float(cos_sim(chunk_emb, embs[i:j]).mean())
                 md = doc.metadata.copy()
                 md.setdefault("split_method", "semantic_simple")
-                md["avg_sim"] = round(avg_sim, 2)  # <— restored
+                md["avg_sim"] = round(avg_sim, 2)
                 out.append(Document(page_content=text, metadata=md))
 
-            # Advance chunk
-            i += window - overlap
+            i += step
 
     return out
 
@@ -153,6 +233,7 @@ class Chunker:
         processed_any = False
         ait = process.inputs.wait_for_frame()
 
+        out_path = ""
         while True:
             try:
                 if not processed_any:
@@ -197,7 +278,7 @@ class Chunker:
                         settings.semantic_window_size.value,
                         settings.semantic_overlap.value,
                         token_model,
-                        max_tokens
+                        max_tokens,
                     )
                 elif strategy == "recursive":
                     return recursive_split_with_headings(
@@ -205,7 +286,8 @@ class Chunker:
                         settings.chunk_size.value,
                         settings.chunk_overlap.value,
                         token_model,
-                        max_tokens
+                        max_tokens,
+                        embedder_model=settings.semantic_model.value,
                     )
                 else:
                     return md_split(
@@ -247,6 +329,10 @@ class Chunker:
 
         print("Chunking: finished; exiting.")
 
+        # Hack: Keep element running as if one element completes all will be killed by platform
+        while True:
+            await asyncio.sleep(1)
+
 process = CreateElement(Process(
     inputs=Inputs(),
     outputs=Outputs(),
@@ -255,7 +341,7 @@ process = CreateElement(Process(
         id="2a7a0b6a-7b84-4c57-8f1c-chunk0000001",
         name="chunking",
         displayName="MM - Chunking",
-        version="0.69.0", 
+        version="0.77.0", 
         description="Splits OCR text docs into highly coherent chunks for RAG (and image-derived text separately)."
     ),
     run_func=Chunker().run

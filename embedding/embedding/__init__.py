@@ -186,7 +186,10 @@ class Embedder:
                 processed_any = True
 
             print("Embedding (ingest): finished; exiting.")
-            return 
+
+            # Hack: Keep element running as if one element completes all will be killed by platform
+            while True:
+                await asyncio.sleep(1)
 
         # Non-ingestion (query)
         while True:
@@ -234,7 +237,7 @@ class Embedder:
                     await outputs.default.send(Frame(None, [], None, None, None, out_other))
 
             except StopAsyncIteration:
-                await asyncio.sleep(0.25)
+                await asyncio.sleep(1)
                 continue
 
 embedder = Embedder()
@@ -247,7 +250,7 @@ process = CreateElement(Process(
         id="2a7a0b6a-7b84-4c57-8f1c-embed000001",
         name="embedding",
         displayName="MM - Embedding",
-        version="0.33.0",
+        version="0.36.0",
         description="Embeds text + image-derived text + image stubs (optional CLIP pixels)."
     ),
     run_func=embedder.run

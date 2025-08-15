@@ -42,7 +42,6 @@ class Settings(ElementSettings):
         description="Generate natural-language captions for images (slower).",
         default=True,
         depends_on=equals("extract_images", True),
-        hints=["advanced"],
     )
     use_chartqa = BoolSetting(
         name="use_chartqa",
@@ -50,5 +49,4 @@ class Settings(ElementSettings):
         description="Attempt to read structured data from chart-like images (slower).",
         default=True,
         depends_on=equals("extract_images", True),
-        hints=["advanced"],
     )

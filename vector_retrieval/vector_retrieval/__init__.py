@@ -596,7 +596,7 @@ process = CreateElement(
             id="2a7a0b6a-7b84-4c57-8f1c-retrv000003",
             name="vector_retrieval",
             displayName="MM - Vector Retrieval",
-            version="0.69.0",
+            version="0.71.0",
             description="Retrieves from <base>_text and <base>_images; merges page snippets; surfaces figures as Markdown links to file://."
         ),
         frame_receiver_func=retriever.frame_receiver,
