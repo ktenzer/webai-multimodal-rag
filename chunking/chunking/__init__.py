@@ -104,6 +104,95 @@ def token_id_chunks(text: str, tok, max_len: int) -> List[str]:
         out.append(tok.decode(sub, skip_special_tokens=True))
     return out
 
+def token_id_sliding_chunks_with_prefix(prefix: str, body: str, tok, max_len: int, overlap_tokens: int) -> list[str]:
+    prefix_ids = tok.encode(prefix, add_special_tokens=False) if prefix else []
+    spacer_ids = tok.encode("\n\n", add_special_tokens=False) if prefix else []
+    body_ids   = tok.encode(body, add_special_tokens=False)
+
+    if not body_ids:
+        return []
+
+    # reserve budget for prefix + spacer
+    reserved = len(prefix_ids) + len(spacer_ids)
+    if reserved >= max_len:
+        # clamp prefix if it alone would overflow
+        keep = max(0, max_len - len(spacer_ids))
+        prefix_ids = prefix_ids[:keep]
+        reserved = len(prefix_ids) + len(spacer_ids)
+
+    payload_cap = max(1, max_len - reserved)
+    # step size to create overlap
+    step = max(1, payload_cap - max(0, overlap_tokens))
+
+    out = []
+    i = 0
+    while i < len(body_ids):
+        win = body_ids[i : i + payload_cap]
+        full = (prefix_ids + spacer_ids + win) if prefix_ids else win
+        out.append(tok.decode(full, skip_special_tokens=True))
+        if i + payload_cap >= len(body_ids):
+            break
+        i += step
+    return out
+
+def count_embed_tokens(text: str, tok) -> int:
+    return len(tok.encode(text, add_special_tokens=False))
+
+def pack_sentences_with_prefix(
+    prefix_tag: str,                 # short tag or "" (we’ll keep it short)
+    body_text: str,
+    tok,                             # embedder tokenizer
+    max_len: int,                    # embedder cap (safe_max)
+    overlap_sents: int = 2           # 1–2 is plenty
+) -> list[str]:
+    """
+    Greedy sentence packer that keeps whole sentences, respects token budget,
+    and (optionally) prepends a SHORT prefix tag to each chunk.
+    """
+    sents = sent_tokenize(body_text) or [body_text]
+    chunks = []
+    i = 0
+
+    # reserve a small prefix once
+    prefix = (prefix_tag.strip() + "\n") if prefix_tag else ""
+    prefix_tokens = count_embed_tokens(prefix, tok) if prefix else 0
+    payload_cap = max(1, max_len - prefix_tokens)
+
+    while i < len(sents):
+        cur = []
+        cur_tokens = 0
+        j = i
+        while j < len(sents):
+            cand = sents[j]
+            cand_tokens = count_embed_tokens(cand, tok)
+            # if single sentence longer than cap, hard-slice it (rare)
+            if cand_tokens > payload_cap:
+                ids = tok.encode(cand, add_special_tokens=False)[:payload_cap]
+                cand = tok.decode(ids, skip_special_tokens=True)
+                cand_tokens = count_embed_tokens(cand, tok)
+
+            if cur_tokens + cand_tokens + (1 if cur else 0) > payload_cap:
+                break
+            cur.append(cand)
+            cur_tokens += cand_tokens + (1 if cur[:-1] else 0)  # account for space/newline
+            j += 1
+
+        if not cur:
+            # fallback: force include at least something
+            force = sents[j] if j < len(sents) else sents[-1]
+            ids = tok.encode(force, add_special_tokens=False)[:payload_cap]
+            cur = [tok.decode(ids, skip_special_tokens=True)]
+            j = max(j, i + 1)
+
+        chunk_body = " ".join(cur).strip()
+        chunk_text = (prefix + chunk_body) if prefix else chunk_body
+        chunks.append(chunk_text)
+
+        # sentence-overlap step
+        i = j - overlap_sents if j - overlap_sents > i else j
+
+    return chunks
+
 def get_embedder_tokenizer_and_limit(model_name: str, fallback: int = 512):
     tok = AutoTokenizer.from_pretrained(model_name)
     # Some tokenizers use a giant sentinel like 1e30 for "no limit"
@@ -132,41 +221,51 @@ def recursive_split_with_headings(
     header = MarkdownHeaderTextSplitter(headers_to_split_on=[("#","h1"),("##","h2"),("###","h3")])
     rc     = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=overlap)
 
-    # One embedder tokenizer reused for all chunks, clamped to 512
     embed_tok, safe_max = get_embedder_tokenizer_and_limit(embedder_model)
 
     out: List[Document] = []
     t0 = time.time()
 
+    # keep the tag short so it doesn’t dominate embeddings
+    def make_tag(sec_md: dict) -> str:
+        h1, h2, h3 = (sec_md.get("h1","") or ""), (sec_md.get("h2","") or ""), (sec_md.get("h3","") or "")
+        parts = [p.strip() for p in (h1, h2, h3) if p]
+        # short tag: just top 1–2 levels
+        tag = "§" + "/".join(parts[:2])
+        return tag[:50]  # hard limit
+
     for doc in docs:
         text = protect_tables(doc.page_content)
         for sec in header.split_text(text):
-            path = " > ".join(filter(None, (
-                sec.metadata.get("h1"),
-                sec.metadata.get("h2"),
-                sec.metadata.get("h3"),
-            )))
+            tag = make_tag(sec.metadata)  # short, stable anchor (or "" to disable)
             for ch in rc.split_text(sec.page_content):
-                chunk = (path + "\n\n" + ch).strip()
-
-                # LLM-side cap first
-                while token_count(chunk, token_model) > max_tokens and " " in chunk:
-                    chunk = chunk.rsplit(" ", 1)[0]
-                while token_count(chunk, token_model) > max_tokens and len(chunk) > 0:
-                    chunk = chunk[:-50]  # fallback for no-space runs
-
-                if not chunk:
+                body = ch.strip()
+                if not body:
                     continue
 
-                # Embedder-side cap 
-                parts = token_id_chunks(chunk, embed_tok, safe_max)
-                if not parts:
-                    continue
-                for p in parts:
-                    out.append(Document(page_content=p, metadata=doc.metadata))
+                # Sentence-pack within the embedder budget
+                pieces = pack_sentences_with_prefix(
+                    prefix_tag=tag,
+                    body_text=body,
+                    tok=embed_tok,
+                    max_len=safe_max,
+                    overlap_sents=2,     # 1–2 sentences overlap
+                )
+
+                # Final LLM-side budget (gentle tail trim only if you must)
+                if max_tokens and token_model:
+                    for p in pieces:
+                        while token_count(p, token_model) > max_tokens and len(p) > 0:
+                            p = p[:-50]
+                        if p:
+                            out.append(Document(page_content=p, metadata=doc.metadata))
+                else:
+                    for p in pieces:
+                        out.append(Document(page_content=p, metadata=doc.metadata))
 
     print(f"[Chunk] recursive_split → {len(out)} chunks in {time.time()-t0:.1f}s")
     return out
+
 
 # Semantic split based on sliding window
 def semantic_split(
@@ -174,10 +273,9 @@ def semantic_split(
     model_name: str,
     window: int,
     overlap: int,
-    token_model: str, 
+    token_model: str,
     max_tokens: int,
 ) -> list[Document]:
-    # Embedder + tokenizer, both clamped to 512
     embedder = SentenceTransformer(model_name)
     try:
         embedder.max_seq_length = 512
@@ -188,41 +286,45 @@ def semantic_split(
     out: list[Document] = []
 
     for doc in docs:
-        # Merge table lines first, then sentence-split
-        base = protect_tables(doc.page_content)
-        sents = sent_tokenize(base) or [base]
+        header = MarkdownHeaderTextSplitter(headers_to_split_on=[("#","h1"),("##","h2"),("###","h3")])
+        sections = header.split_text(protect_tables(doc.page_content))
 
-        # Token-ID split: guarantee each piece under embedder cap
-        safe_sents: list[str] = []
-        for s in sents:
-            safe_sents.extend(token_id_chunks(s, embed_tok, safe_max))
-        if not safe_sents:
-            continue
+        for sec in sections:
+            # short tag, not full breadcrumb
+            h1, h2 = (sec.metadata.get("h1") or ""), (sec.metadata.get("h2") or "")
+            tag = ("§" + "/".join([p for p in (h1, h2) if p]))[:50]
 
-        embs = embedder.encode(safe_sents, convert_to_tensor=True, show_progress_bar=False)
+            base = sec.page_content
+            # First, sentence-pack to the embedder budget directly (no mid-sentence cuts)
+            pieces = pack_sentences_with_prefix(
+                prefix_tag=tag,
+                body_text=base,
+                tok=embed_tok,
+                max_len=safe_max,
+                overlap_sents=2,  # 1–2 sentence overlap
+            )
+            if not pieces:
+                continue
 
-        i, step = 0, max(1, window - overlap)
-        while i < len(safe_sents):
-            j = min(i + window, len(safe_sents))
-            text = " ".join(safe_sents[i:j]).strip()
+            # (Optional) If you still want windowing for avg_sim diagnostics, you can skip it for production.
+            # We’ll embed each piece as-is.
+            embs = embedder.encode(pieces, convert_to_tensor=True, show_progress_bar=False)
 
-            # LLM-side budget (may be a different tokenizer)
-            while token_count(text, token_model) > max_tokens and " " in text:
-                text = text.rsplit(" ", 1)[0]
-            while token_count(text, token_model) > max_tokens and len(text) > 0:
-                text = text[:-50]
+            for idx, text in enumerate(pieces):
+                # LLM-side gentle cap
+                if max_tokens and token_model:
+                    while token_count(text, token_model) > max_tokens and len(text) > 0:
+                        text = text[:-50]
+                if not text:
+                    continue
 
-            if text:
-                chunk_emb = embs[i:j].mean(dim=0, keepdim=True)
-                avg_sim = float(cos_sim(chunk_emb, embs[i:j]).mean())
                 md = doc.metadata.copy()
                 md.setdefault("split_method", "semantic_simple")
-                md["avg_sim"] = round(avg_sim, 2)
+                # (If you kept per-piece embs, you could store a quality score; not required)
                 out.append(Document(page_content=text, metadata=md))
 
-            i += step
-
     return out
+
 
 # Chunker
 class Chunker:
@@ -341,7 +443,7 @@ process = CreateElement(Process(
         id="2a7a0b6a-7b84-4c57-8f1c-chunk0000001",
         name="chunking",
         displayName="MM - Chunking",
-        version="0.77.0", 
+        version="0.79.0", 
         description="Splits OCR text docs into highly coherent chunks for RAG (and image-derived text separately)."
     ),
     run_func=Chunker().run
