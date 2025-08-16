@@ -29,7 +29,7 @@ from webai_element_sdk.comms.messages import Frame
 
 from .element import Inputs, Outputs, Settings
 
-TOKENIZERS_PARALLELISM=False
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 IDLE_TIMEOUT = 3.0  # seconds
 
 # Protect table data merging contiguous lines
@@ -194,18 +194,18 @@ def pack_sentences_with_prefix(
     return chunks
 
 def get_embedder_tokenizer_and_limit(model_name: str, fallback: int = 512):
+    # We will *enforce* fallback as the real cap (safe_max) ourselves,
+    # but set a HUGE model_max_length on the tokenizer to prevent HF warnings
+    # when we momentarily tokenize long strings to count/split.
     tok = AutoTokenizer.from_pretrained(model_name)
-    # Some tokenizers use a giant sentinel like 1e30 for "no limit"
-    raw = getattr(tok, "model_max_length", None)
-    if raw is None or raw > 10**8:  
-        raw = fallback
-    # leave headroom for specials
-    safe_max = max(8, int(raw) - 2)
-    # clamp tokenizer
+
+    # Silence "sequence length longer than max length" warnings during counting
     try:
-        tok.model_max_length = int(raw)
+        tok.model_max_length = int(1e9)  # huge -> no warning while we pre-split
     except Exception:
         pass
+
+    safe_max = int(fallback)            # the true budget we enforce downstream
     return tok, safe_max
 
 
@@ -271,60 +271,65 @@ def recursive_split_with_headings(
 def semantic_split(
     docs: list[Document],
     model_name: str,
-    window: int,
-    overlap: int,
+    window: int,          # unused now; kept for signature compatibility
+    overlap: int,         # unused now; we use sentence overlap below
     token_model: str,
     max_tokens: int,
 ) -> list[Document]:
-    embedder = SentenceTransformer(model_name)
-    try:
-        embedder.max_seq_length = 512
-    except Exception:
-        pass
+    """
+    Token-safe, sentence-aware splitter that PREPARES chunks for a given embedder
+    without calling the embedder. This avoids the 2690>512 error entirely.
+    """
+
+    # Use the SAME HF tokenizer your embedder will use to enforce the cap now.
     embed_tok, safe_max = get_embedder_tokenizer_and_limit(model_name)
 
     out: list[Document] = []
+    header = MarkdownHeaderTextSplitter(headers_to_split_on=[("#","h1"),("##","h2"),("###","h3")])
 
     for doc in docs:
-        header = MarkdownHeaderTextSplitter(headers_to_split_on=[("#","h1"),("##","h2"),("###","h3")])
         sections = header.split_text(protect_tables(doc.page_content))
 
         for sec in sections:
-            # short tag, not full breadcrumb
+            # short, stable tag to give the chunk some local context without polluting too much
             h1, h2 = (sec.metadata.get("h1") or ""), (sec.metadata.get("h2") or "")
             tag = ("§" + "/".join([p for p in (h1, h2) if p]))[:50]
 
-            base = sec.page_content
-            # First, sentence-pack to the embedder budget directly (no mid-sentence cuts)
+            # Pack whole sentences under the embedder's token budget, with small sentence overlap
             pieces = pack_sentences_with_prefix(
                 prefix_tag=tag,
-                body_text=base,
+                body_text=sec.page_content,
                 tok=embed_tok,
                 max_len=safe_max,
-                overlap_sents=2,  # 1–2 sentence overlap
+                overlap_sents=2,   # 1–2 sentence overlap is usually enough
             )
             if not pieces:
                 continue
 
-            # (Optional) If you still want windowing for avg_sim diagnostics, you can skip it for production.
-            # We’ll embed each piece as-is.
-            embs = embedder.encode(pieces, convert_to_tensor=True, show_progress_bar=False)
+            # Hard-guard: if any piece still slipped over (safety), split by token-ids
+            safe_pieces: list[str] = []
+            for p in pieces:
+                ids = embed_tok.encode(p, add_special_tokens=False)
+                if len(ids) > safe_max:
+                    for i in range(0, len(ids), safe_max):
+                        sub = embed_tok.decode(ids[i:i+safe_max], skip_special_tokens=True)
+                        if sub.strip():
+                            safe_pieces.append(sub)
+                else:
+                    safe_pieces.append(p)
 
-            for idx, text in enumerate(pieces):
-                # LLM-side gentle cap
+            # Final LLM-side cap (may be a different tokenizer)
+            for text in safe_pieces:
                 if max_tokens and token_model:
                     while token_count(text, token_model) > max_tokens and len(text) > 0:
                         text = text[:-50]
                 if not text:
                     continue
-
                 md = doc.metadata.copy()
                 md.setdefault("split_method", "semantic_simple")
-                # (If you kept per-piece embs, you could store a quality score; not required)
                 out.append(Document(page_content=text, metadata=md))
 
     return out
-
 
 # Chunker
 class Chunker:
@@ -443,7 +448,7 @@ process = CreateElement(Process(
         id="2a7a0b6a-7b84-4c57-8f1c-chunk0000001",
         name="chunking",
         displayName="MM - Chunking",
-        version="0.79.0", 
+        version="0.85.0", 
         description="Splits OCR text docs into highly coherent chunks for RAG (and image-derived text separately)."
     ),
     run_func=Chunker().run
