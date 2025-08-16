@@ -87,27 +87,32 @@ def rerank(query: str, docs: List[str], metas: List[dict], keep: int, reranker_m
 
 class _BM25Cache:
     def __init__(self):
-        self.cache = {}
+        self.cache = {}  # (db_dir, base) -> (bm25, docs, metas)
+
     def get(self, client, base: str, db_dir: Path):
         key = (db_dir, base)
         if key in self.cache:
             return self.cache[key]
         try:
+            # TEXT ONLY here (keep OCR/image text out of lexical BM25)
             cols = []
-            for name in (f"{base}_text", f"{base}_images"):
+            for name in (f"{base}_text",):
                 try:
                     c = client.get_collection(name)
                     if c and c.count() > 0:
                         cols.append(c)
                 except:
                     pass
+
             docs, metas = [], []
             for c in cols:
                 data  = c.get()
                 docs += data["documents"]
                 metas += data["metadatas"]
+
             if not docs:
                 return (None, [], [])
+
             bm = BM25Store([d.lower() for d in docs])
             self.cache[key] = (bm, docs, metas)
             return bm, docs, metas
@@ -115,6 +120,25 @@ class _BM25Cache:
             return (None, [], [])
 
 bm25_cache = _BM25Cache()
+
+def _l2norm_rows(a: np.ndarray) -> np.ndarray:
+    if a.size == 0:
+        return a
+    n = np.linalg.norm(a, axis=1, keepdims=True) + 1e-12
+    return a / n
+
+def _dedup_by_section(docs: List[str], metas: List[dict], max_same: int = 2):
+    seen = {}
+    keep_docs, keep_metas = [], []
+    for d, m in zip(docs, metas):
+        key = (m.get("source"), m.get("page"), m.get("h1"), m.get("h2"), m.get("h3"))
+        seen[key] = seen.get(key, 0) + 1
+        if seen[key] <= max_same:
+            keep_docs.append(d); keep_metas.append(m)
+    return keep_docs, keep_metas
+
+def _section_key(m: dict):
+    return (m.get("source"), m.get("page"), m.get("h1"), m.get("h2"))
 
 def _base(settings) -> str:
     return settings.postgres_table_name.value or "default"
@@ -179,9 +203,25 @@ def _query_pg_table(conn, table: str, q_emb: list, limit: int):
         rows = []
     finally:
         cur.close()
+
     docs, metas, emb_list = [], [], []
     for doc, meta, emb in rows:
-        docs.append(doc); metas.append(meta)
+        # Normalize metadata to dict
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except Exception:
+                import ast
+                try:
+                    meta = ast.literal_eval(meta)
+                except Exception:
+                    meta = {} 
+        elif meta is None:
+            meta = {}
+
+        docs.append(doc)
+        metas.append(meta)
+
         if isinstance(emb, str):
             try:
                 arr = json.loads(emb)
@@ -365,6 +405,7 @@ class Retriever:
 
         while True:
             frame    = await self.q.get()
+
             other    = getattr(frame, "other_data", {}) or {}
             embeds_in= other.get("embeddings")
             q_text   = (other.get("message","") or getattr(frame,"text","") or "").strip()
@@ -383,7 +424,7 @@ class Retriever:
                 K_FINAL = max(K_FINAL, 6)
                 K_MMR   = max(K_MMR, 24)
 
-            if isinstance_embeds := isinstance(embeds_in[0], (float,int)):
+            if isinstance(embeds_in[0], (float, int)):
                 query_emb  = np.asarray(embeds_in, dtype=np.float32)
                 q_emb_list = [query_emb.tolist()]
             else:
@@ -391,7 +432,7 @@ class Retriever:
                 query_emb  = np.asarray(embeds_in[0], dtype=np.float32)
 
             store_type = settings.vector_store_type.value
-            n_initial = max(60, K_MMR + K_BM25 + 10)
+            n_initial = max(80, K_MMR + K_BM25 + 20)
 
             # ChromaDB
             if store_type == "chromadb":
@@ -436,8 +477,13 @@ class Retriever:
                     continue
 
                 embs_raw = np.asarray(emb_list, dtype=np.float32)
+
                 bm25 = None
                 corpus_docs = []; corpus_metas = []
+
+
+            query_emb = query_emb / (np.linalg.norm(query_emb) + 1e-12)
+            embs_raw  = _l2norm_rows(embs_raw)
 
             # MMR over ANN candidates
             docs_mmr, metas_mmr = mmr_select(query_emb, embs_raw, docs_raw, metas_raw, k=K_MMR, weight=0.4)
@@ -453,17 +499,35 @@ class Retriever:
             docs_all, metas_all = docs_mmr + docs_bm, metas_mmr + metas_bm
             if q_text and docs_all:
                 scores = self.reranker.predict([(q_text, d or " ") for d in docs_all])
-                if max(scores) < 0.35 and docs_bm:
+                if max(scores) < 0.30 and docs_bm:  # was 0.35
                     docs, metas = docs_bm[:K_FINAL], metas_bm[:K_FINAL]
                 else:
                     docs, metas = rerank(q_text, docs_all, metas_all, keep=K_FINAL, reranker_model=self.reranker)
             else:
                 docs, metas = docs_all, metas_all
 
-            # Merge snippets by (source,page)
+
+            # Light dedupe to keep diversity
+            docs, metas = _dedup_by_section(docs, metas, max_same=2)
+
+            # Small bias for procedural queries to keep contiguous section together
+            if _is_procedural(q_text) and docs and metas:
+                target = _section_key(metas[0])
+                paired = [(i, int(_section_key(m) == target)) for i, m in enumerate(metas)]
+                paired.sort(key=lambda x: x[1], reverse=True)
+                docs  = [docs[i]  for i, _ in paired][:K_FINAL]
+                metas = [metas[i] for i, _ in paired][:K_FINAL]
+
+            # Build prompt blocks and citations
+            blocks = []
+            for i, (d, m) in enumerate(zip(docs, metas), 1):
+                snippet = _shorten(d, 600)
+                blocks.append(f"{_label(m, i)}\n{snippet}")
+
+
             docs_merged, metas_merged = _merge_by_page(docs, metas, max_chars=1600)
 
-            # Attach images by (source, page) and enrich with file URLs
+            # Attach images by (source, page)
             page_pairs = _collect_page_pairs(metas_merged)
             images_attached: List[Dict[str, Any]] = []
             if store_type == "chromadb":
@@ -471,12 +535,6 @@ class Retriever:
             else:
                 images_attached = _images_for_pages_pg(pg_conn_info, base, page_pairs)
             images_attached = _enrich_images(images_attached)
-
-            # Build prompt blocks and citations
-            blocks = []
-            for i, (d, m) in enumerate(zip(docs_merged, metas_merged), 1):
-                snippet = _shorten(d, 600)
-                blocks.append(f"{_label(m, i)}\n{snippet}")
 
             # Always surface images if we have them, as Markdown links (clickable)
             if images_attached:
@@ -605,7 +663,7 @@ process = CreateElement(
             id="2a7a0b6a-7b84-4c57-8f1c-retrv000003",
             name="vector_retrieval",
             displayName="MM - Vector Retrieval",
-            version="0.72.0",
+            version="0.87.0",
             description="Retrieves from <base>_text and <base>_images; merges page snippets; surfaces figures as Markdown links to file://."
         ),
         frame_receiver_func=retriever.frame_receiver,
